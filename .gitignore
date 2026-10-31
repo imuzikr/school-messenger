@@ -1,0 +1,54 @@
+# Local builds, test runs and backups
+/.artifacts/
+/.backups/
+/dist/
+node_modules/
+*.zip
+*.log
+
+# Windows Electron runtime (pinned in /version)
+/*.exe
+/*.dll
+/*.pak
+/*.bin
+/icudtl.dat
+/vk_swiftshader_icd.json
+/LICENSE
+/LICENSES.chromium.html
+/locales/
+/resources/*.asar
+
+# Accounts, local history, transferred files and login credentials
+.dingdong-server/
+.ieum-server/
+DingdongClient/
+DingdongServer/
+DingdongDemo/
+IeumClient/
+IeumServer/
+IeumDemo/
+server-data/
+private-history/
+relay-files/
+*.sqlite*
+*.db
+*.db-*
+*.dingdong
+*.ieum
+*.pem
+*.key
+*.pfx
+*.p12
+connection.json
+server-config.json
+dingdong-server.json
+ieum-server.json
+remembered-login.bin*
+.env
+.env.*
+
+# Local tooling
+/.codex/
+/.aws/
+Thumbs.db
+Desktop.ini

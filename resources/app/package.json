@@ -1,0 +1,23 @@
+{
+  "name": "dingdong-school-messenger",
+  "version": "0.2.130",
+  "private": true,
+  "description": "학교 교내망용 띵동 서버와 설치형 메신저",
+  "author": "Dingdong",
+  "license": "UNLICENSED",
+  "main": "desktop/main.cjs",
+  "dependencies": {
+    "@peculiar/x509": "2.1.0",
+    "jose": "6.2.14",
+    "reflect-metadata": "0.2.2"
+  },
+  "dingdongRole": "demo",
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test tests/*.test.cjs",
+    "build:windows-demo": "node scripts/build-windows.cjs demo",
+    "build:windows-client": "node scripts/build-windows.cjs client",
+    "build:windows-server": "node scripts/build-windows.cjs server"
+  },
+  "productName": "띵동"
+}
