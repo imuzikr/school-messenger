@@ -9,7 +9,10 @@ fs.mkdirSync(run,{recursive:true});
 let server,child;
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 async function main(){
-  server=await startServer({port:0,host:'127.0.0.1',address:'https://localhost:8443',dataDir:path.join(run,'server'),admin:{username:'qa',password:'Fixture-native-123',name:'시험 교사'}});
+  let diskShortage=false;
+  server=await startServer({port:0,host:'127.0.0.1',address:'https://localhost:8443',dataDir:path.join(run,'server'),admin:{username:'qa',password:'Fixture-native-123',name:'시험 교사'},attachmentFreeBytes:root=>{
+    if(diskShortage)return 1024**3;const v=fs.statfsSync(root);return v.bavail*(v.frsize||v.bsize);
+  }});
   const profile=path.join(run,'profile');fs.mkdirSync(profile);fs.writeFileSync(path.join(profile,'connection.json'),JSON.stringify(server.connection));
   child=spawn(process.env.DINGDONG_TEST_EXECUTABLE||path.join(root,'Dingdong.exe'),[...(process.env.DINGDONG_TEST_EXECUTABLE?[]:['--dingdong-client']),'--inspect=127.0.0.1:0','--remote-debugging-address=127.0.0.1','--remote-debugging-port=0'],{env:{...process.env,DINGDONG_TEST_DATA_DIR:profile},windowsHide:true,stdio:['ignore','pipe','pipe']});
   let debug='',stderr='';child.stderr.on('data',v=>{stderr+=v;const m=stderr.match(/DevTools listening on ws:\/\/127\.0\.0\.1:(\d+)\//);if(m)debug=m[1];});
@@ -120,7 +123,32 @@ async function main(){
   await ui.run("document.querySelector('[data-action=retry-send-mail]').click();true");
   await ui.wait("document.querySelector('.mail-delivery-status')?.innerText.includes('PC 저장 완료 0/1명') && !document.querySelector('[data-action=retry-send-mail]')");
   assert.ok((await client.request('/bootstrap')).data.mails.some(m=>m.id===failedOp.value.id));await evaluate("window.dingdongDesktop.request('/bootstrap')");
-  await ui.cmd('Page.reload');await ui.wait("!!document.querySelector('[data-action=open-mail][data-mail=native-send-failure]')");await ui.run("document.querySelector('[data-action=open-mail][data-mail=native-send-failure]').click();true");await ui.wait(counts(1,0,0));await ui.shot('retry-delivered');ui.close();
+  await ui.cmd('Page.reload');await ui.wait("!!document.querySelector('[data-action=open-mail][data-mail=native-send-failure]')");await ui.run("document.querySelector('[data-action=open-mail][data-mail=native-send-failure]').click();true");await ui.wait(counts(1,0,0));await ui.shot('retry-delivered');
+  diskShortage=true;
+  const spaceFile=await evaluate("(async()=>{const api=window.dingdongDesktop;const f=await api.stageAttachment('begin',{name:'수업자료.txt',bytes:3,mime:'text/plain'});await api.stageAttachment('chunk',{localFile:f.localFile,offset:0,data:new Uint8Array([65,66,67])});return api.stageAttachment('finish',f);})()");
+  const spaceOp={type:'mail.send',value:{id:'native-storage-shortage',title:'첨부 공간 부족 시험',body:'시험 파일',to:[created.id],cc:[],files:[spaceFile]}};
+  const queued=await evaluate('window.dingdongDesktop.request("/sync",'+JSON.stringify({operations:[spaceOp]})+')');assert.ok(queued.ok);
+  ui.close();ui=await openMail(spaceOp.value.id);
+  await ui.cmd('Page.reload');await ui.wait("!!document.querySelector('[data-action=open-mail][data-mail=native-storage-shortage]')");
+  await ui.run("document.querySelector('[data-action=open-mail][data-mail=native-storage-shortage]').click();true");
+  await ui.wait("document.querySelector('.mail-delivery-status.error')?.innerText.includes('서버 저장 공간이 부족') && !!document.querySelector('[data-action=retry-send-mail]')");
+  await ui.shot('attachment-space-shortage');diskShortage=false;
+  await ui.run("document.querySelector('[data-action=retry-send-mail]').click();true");
+  await ui.wait("document.querySelector('.mail-delivery-status')?.innerText.includes('PC 저장 완료 0/1명')");
+  assert.ok((await client.request('/bootstrap')).data.mails.some(m=>m.id===spaceOp.value.id));
+  const spaceDownload=await client.request('/attachment',{mail:spaceOp.value.id,index:0});assert.equal(spaceDownload.file.sha256,spaceFile.sha256);
+  await evaluate("window.dingdongDesktop.request('/bootstrap')");
+  await ui.run("document.querySelector('#mail-folder-select').value='inbox';document.querySelector('#mail-folder-select').dispatchEvent(new Event('change',{bubbles:true}));true");
+  const due=Date.now()+6000;
+  const scheduled={type:'mail.send',value:{id:'native-scheduled-inbox',title:'예약 도착 시험',body:'열린 수신함에 자동 표시',html:'',to:[login.user.id],cc:[],files:[],scheduled:new Date(due).toISOString()}};
+  const submitted=await client.request('/sync',{operations:[scheduled]});assert.equal(submitted.delivery[scheduled.value.id],'sent');
+  const visible="!!document.querySelector('[data-action=open-mail][data-mail=native-scheduled-inbox]')";
+  assert.ok(Date.now()<due);assert.equal(await ui.run(visible),false);
+  // From submission until arrival, the recipient only observes the open inbox DOM.
+  await ui.wait(visible,150);
+  const scheduledDelayMs=Date.now()-due;assert.ok(scheduledDelayMs>=0);
+  assert.equal(await ui.run("document.querySelectorAll('[data-action=open-mail][data-mail=native-scheduled-inbox]').length"),1);
+  await client.request('/bootstrap');ui.close();
   await evaluate("document.querySelector('[data-action=\"settings\"]').click();true");
   await evaluate("document.querySelector('[data-action=\"privacy-settings\"]').click();true");
   for(let i=0;i<50&&!await evaluate("!!document.querySelector('#privacy-person')");i++)await sleep(100);
@@ -161,7 +189,7 @@ async function main(){
     const mainProbe=await evaluate('clearInterval(window.__fileProbeTimer);window.__fileProbe');await evaluate("window.dingdongDesktop.request('/bootstrap')");
     largeFileUI={bytes:mail.files[0].bytes,stagingMs,transmittedMs,composeProbe,mainProbe,sha256:hash};fs.unlinkSync(large);
   }else ui.close();
-  const measurement={ok:true,version:require('../package.json').version,brand:'띵동',incomingRecoveryUI:true,attachmentLimitsUI:true,largeFileUI,run,profile,fingerprint:security.fingerprint,serverBodyPurged:server.stats().messages===0,serverRows,offlineReadReceiptDelivered:true,deliveryStatusUI:true,retryButtonDelivered:true,electron:await evaluate('navigator.userAgent')};
+  const measurement={ok:true,version:require('../package.json').version,brand:'띵동',incomingRecoveryUI:true,scheduledDelayMs,attachmentLimitsUI:true,largeFileUI,run,profile,fingerprint:security.fingerprint,serverBodyPurged:server.stats().messages===0,serverRows,offlineReadReceiptDelivered:true,deliveryStatusUI:true,retryButtonDelivered:true,electron:await evaluate('navigator.userAgent')};
   fs.writeFileSync(path.join(run,'result.json'),JSON.stringify(measurement,null,2));console.log(JSON.stringify(measurement));
   if(process.argv.includes('--hold')){console.log('Holding isolated Electron window for visual QA. Create '+path.join(run,'stop')+' to close.');while(!fs.existsSync(path.join(run,'stop')))await sleep(500);}
   client.close();ws.close();child.kill();await server.close();

@@ -372,6 +372,7 @@
       $(".login-note").textContent="자동 로그인은 본인 전용 Windows 계정에서 선택하세요. 비밀번호는 저장하지 않습니다.";
       if(network?.waitingForServer)$("#login-error").textContent="자동 로그인 대기 중입니다. 교내 서버에 연결되면 다시 시도합니다.";
       $(".login-note").insertAdjacentHTML("beforebegin",button("privacy-import","기존 PC 보관 파일 가져오기","folder"));
+      $(".login-note").insertAdjacentHTML("beforebegin",'<button type="button" class="btn" data-action="request-key-recovery" hidden>새 PC 보안 키 복구 요청</button>');
       $("#login-form").insertAdjacentHTML("afterbegin",`<div class="connection-row"><span>${esc(network?.connection?.schoolName||"서버 연결 파일이 필요합니다")}</span>${button("import-server","서버 연결","link")}</div>`);
     }
   }
@@ -1397,6 +1398,7 @@
     const sent=await save();
     if(!sent){state.data.mails=state.data.mails.filter(item=>item.id!==m.id);state.data.events=state.data.events.filter(item=>item.noticeMail!==m.id&&item.id!==m.calendarEvent);mailSending=false;if(submit)submit.disabled=false;error.textContent="발송하지 못했습니다. 저장 공간과 연결을 확인하고 다시 보내 주세요.";return;}
     const delivery=native?network.lastSyncResult?.delivery?.[m.id]:null;
+    if(delivery==='review'){mailSending=false;error.textContent='발송 여부 확인이 필요합니다. 보낸함에 원문을 보관했습니다. 창을 닫고 수신자에게 확인해 주세요.';return;}
     if(delivery==='failed'){mailSending=false;if(submit)submit.disabled=false;error.textContent='발송하지 못했습니다. 보낸 메시지함에 실패 사유와 원문을 보관했습니다. 내용을 고쳐 보내거나 보낸함에서 다시 시도해 주세요.';return;}
     closeModal();mailSending=false;
     if(requestedCompose){await windowApi.composeSent();return;}
@@ -2145,11 +2147,23 @@
     if(!native?.privacy)return;
     const result=await native.privacy('security');if(result.error){toast('보안 정보를 열지 못했어요',result.error);return;}
     const format=value=>String(value).match(/.{1,4}/g).join(' ');
-    openModal('내 메시지 보관·보안',`<p>메시지와 주고받은 기록은 각자의 PC에 보관합니다. 메시지·읽음·회신 알림은 암호화하여 전달하고, 상대 PC의 저장 확인 후 서버에서 삭제합니다. 첨부 파일은 암호화 없이 서버에서 10일간 제공합니다.</p><p class="muted">PC를 바꾸기 전에 보관 파일을 내보내고 이전 PC의 앱을 종료해 주세요. 새 PC에서 같은 학교 계정으로 가져올 수 있습니다.</p><div class="setting-row"><div>PC 교체용 파일<small>메시지와 첨부파일을 비밀번호 없이 파일 하나로 저장</small></div>${button('privacy-export','내보내기','download')}</div><div class="setting-row"><div>기존 PC에서 가져오기<small>같은 학교 서버와 계정의 보관 파일</small></div>${button('privacy-import','가져오기','folder')}</div><p><strong>내 보안 번호</strong></p><p style="word-break:break-all;font-family:monospace">${esc(format(result.fingerprint))}</p><p class="muted">상대방이 자신의 화면에서 확인한 보안 번호를 직접 대조하세요. 처음 연결할 때 받은 번호는 자동 보관하며, 번호가 바뀌면 송수신을 중단합니다.</p><label>확인할 상대방<select id="privacy-person" class="input">${result.people.filter(p=>p.id!==state.profile?.id).map(p=>`<option value="${esc(p.id)}">${esc(person(p.id).name)}${p.verified?' · 확인됨':''}</option>`).join('')}</select></label><label>상대방에게 직접 받은 보안 번호<input id="privacy-number" class="input" autocomplete="off" maxlength="100" placeholder="상대방 화면의 내 보안 번호"></label><p id="privacy-error" class="form-error" role="alert"></p>${button('privacy-verify','번호 대조하기','check')}${result.incomingFailed?`<div class="setting-row"><div>수신 확인 필요 ${result.incomingFailed}건<small>수신에 문제가 있는 항목을 따로 표시하며 다른 메시지는 계속 받습니다. 발신자에게 재전송을 요청하거나 보안 번호를 확인한 뒤 다시 시도하세요.</small></div>${button('privacy-retry-incoming','수신 다시 확인','refresh')}</div>`:''}<p class="muted">전달 대기 ${result.pending}건 · 전달 실패 ${result.failed||0}건 · 백업 확인 필요 ${result.restoreReview||0}건<br>PC 보관 위치</p><p class="muted" style="word-break:break-all">${esc(result.path)}</p>`,button('close-modal','닫기'),'work-modal');
+    openModal('내 메시지 보관·보안',`<p>메시지와 주고받은 기록은 각자의 PC에 보관합니다. 메시지·읽음·회신 알림은 암호화하여 전달하고, 상대 PC의 저장 확인 후 서버에서 삭제합니다. 첨부 파일은 암호화 없이 서버에서 10일간 제공합니다.</p><p class="muted">PC를 바꾸기 전에 보관 파일을 내보내고 이전 PC의 앱을 종료해 주세요. 새 PC에서 같은 학교 계정으로 가져올 수 있습니다.</p><div class="setting-row"><div>PC 교체용 파일<small>메시지와 첨부파일을 비밀번호 없이 파일 하나로 저장</small></div>${button('privacy-export','내보내기','download')}</div><div class="setting-row"><div>기존 PC에서 가져오기<small>같은 학교 서버와 계정의 보관 파일</small></div>${button('privacy-import','가져오기','folder')}</div><p><strong>내 보안 번호</strong></p><p style="word-break:break-all;font-family:monospace">${esc(format(result.fingerprint))}</p><p class="muted">상대방이 자신의 화면에서 확인한 보안 번호를 직접 대조하세요. 처음 연결할 때 받은 번호는 자동 보관하며, 번호가 바뀌면 송수신을 중단합니다.</p><label>확인할 상대방<select id="privacy-person" class="input">${result.people.filter(p=>p.id!==state.profile?.id).map(p=>`<option value="${esc(p.id)}">${esc(person(p.id).name)}${p.changed?' · 새 번호 확인 필요':p.verified?' · 확인됨':''}</option>`).join('')}</select></label><label>상대방에게 직접 받은 보안 번호<input id="privacy-number" class="input" autocomplete="off" maxlength="100" placeholder="상대방 화면의 내 보안 번호"></label><p id="privacy-error" class="form-error" role="alert"></p>${button('privacy-verify','번호 대조하기','check')}${result.incomingFailed?`<div class="setting-row"><div>수신 확인 필요 ${result.incomingFailed}건<small>수신에 문제가 있는 항목을 따로 표시하며 다른 메시지는 계속 받습니다. 발신자에게 재전송을 요청하거나 보안 번호를 확인한 뒤 다시 시도하세요.</small></div>${button('privacy-retry-incoming','수신 다시 확인','refresh')}</div>`:''}<p class="muted">전달 대기 ${result.pending}건 · 전달 실패 ${result.failed||0}건 · 발송 여부 확인 필요 ${result.restoreReview||0}건<br>PC 보관 위치</p><p class="muted" style="word-break:break-all">${esc(result.path)}</p>`,button('close-modal','닫기'),'work-modal');
   }
   async function verifyPrivacyNumber(){
     const result=await native.privacy('verify',{id:$('#privacy-person').value,fingerprint:$('#privacy-number').value});
-    if(result.error){$('#privacy-error').textContent=result.error;return;}toast('상대방 보안 번호를 확인했어요');await privacySettings();
+    if(result.error){$('#privacy-error').textContent=result.error;return;}await network.refresh();toast('상대방 보안 번호를 확인했어요');await privacySettings();
+  }
+  function requestKeyRecovery(){
+    openModal('새 PC 보안 키 복구 요청','<p>기존 PC와 보관 파일을 모두 잃었을 때 같은 계정으로 다시 시작합니다. 새 PC에서 이전 기록을 복원할 수 없습니다.</p><p>관리자가 승인하면 이전 키로 아직 받지 못한 메시지와 내가 보내 둔 미전달·예약 메시지의 남은 전달이 취소됩니다. 상대방이 이미 저장한 기록은 각자 보관합니다.</p><label><input id="recovery-loss" type="checkbox"> 위 내용을 확인했고 이 PC로 복구를 요청합니다.</label><p id="recovery-result" role="status"></p>',button('close-modal','닫기')+button('issue-recovery-code','요청 코드 받기'),'work-modal');
+    const submit=$('[data-action=issue-recovery-code]'),consent=$('#recovery-loss'),message=$('#recovery-result');submit.disabled=true;
+    consent.onchange=()=>{submit.disabled=!consent.checked;};
+    submit.onclick=async()=>{
+      if(!consent.checked||submit.disabled)return;submit.disabled=true;consent.disabled=true;
+      try{
+        const r=await native.privacy('request-key-recovery',{acceptLoss:true});if(r.error)throw Error(r.error);
+        message.textContent='요청 코드 '+r.code.match(/.{4}/g).join('-')+' · 15분간 유효합니다. 관리자에게 본인임을 확인받고 이 코드를 전달하세요. 승인 후 같은 아이디와 비밀번호로 다시 로그인하세요.';
+      }catch(e){message.textContent=e.message;consent.disabled=false;submit.disabled=false;}
+    };
   }
   function privacyArchive(action){
     if(!native?.privacy)return;
@@ -2407,6 +2421,7 @@
     if(action==="privacy-settings"){await privacySettings();return;}
     if(action==="privacy-export"||action==="privacy-import"){privacyArchive(action==="privacy-export"?"export":"import");return;}
     if(action==="privacy-verify"){await verifyPrivacyNumber();return;}
+    if(action==="request-key-recovery"){requestKeyRecovery();return;}
     if(action==="privacy-retry-incoming"){target.disabled=true;try{const result=await native.privacy('retry-incoming');if(result.error)throw Error(result.error);await network.refresh();await privacySettings();toast(result.incomingFailures?'수신 확인이 필요한 메시지가 남아 있어요':'수신을 다시 확인했어요',result.incomingFailures?'발신자에게 재전송을 요청하거나 상대방 보안 번호를 확인해 주세요.':'');}catch(error){toast('수신을 다시 확인하지 못했어요',error.message);}finally{target.disabled=false;}return;}
     if(action === "window-minimize" || action === "window-close" || action === "window-maximize" || action === "window-minimal" || action === "window-restore-main"){windowApi?.windowAction(action.slice(7));return;}
     if(action === "makeup-notice"){if(target.closest(".school-work-menu"))closeModal();composeMail({noticeType:"makeup",title:"보강 안내",to:[...state.selected]});return;}
@@ -2754,7 +2769,7 @@
       }
       case "retry-send-mail": {
         target.disabled=true;
-        try{await network.queue;const result=await native.request('/sync',{operations:[{type:'mail.retry',id:d.mail}]});if(result.error)throw new Error(result.error);await network.refresh();toast(result.delivery?.[d.mail]==='failed'?'다시 발송하지 못했습니다':result.delivery?.[d.mail]==='queued'?'PC에 발송 대기 중입니다':'서버에 전달했습니다',result.delivery?.[d.mail]==='failed'?'메시지에 표시된 사유를 확인해 주세요.':'상대 PC 저장과 읽음은 따로 표시됩니다.');}catch(error){toast('다시 보내지 못했습니다',error.message);}finally{if(target.isConnected)target.disabled=false;}
+        try{await network.queue;const result=await native.request('/sync',{operations:[{type:'mail.retry',id:d.mail}]});if(result.error)throw new Error(result.error);await network.refresh();if(result.delivery?.[d.mail]==='review'){toast('발송 여부 확인 필요','수신자에게 확인한 뒤 보낸함에서 원문을 확인해 주세요.');break;}toast(result.delivery?.[d.mail]==='failed'?'다시 발송하지 못했습니다':result.delivery?.[d.mail]==='queued'?'PC에 발송 대기 중입니다':'서버에 전달했습니다',result.delivery?.[d.mail]==='failed'?'메시지에 표시된 사유를 확인해 주세요.':'상대 PC 저장과 읽음은 따로 표시됩니다.');}catch(error){toast('다시 보내지 못했습니다',error.message);}finally{if(target.isConnected)target.disabled=false;}
         break;
       }
       case "redraft-mail": {
@@ -3127,9 +3142,9 @@
         return;
       }
       if(native){
-        const submit=$("#login-form button[type=submit]");const label=submit.textContent;submit.disabled=true;submit.textContent="로그인 준비 중…";$("#login-error").textContent="";
+        const submit=$("#login-form button[type=submit]");const label=submit.textContent;submit.disabled=true;submit.textContent="로그인 준비 중…";$("#login-error").textContent="";$('[data-action=request-key-recovery]').hidden=true;
         try{const user=await network.login(name,$("#login-password").value,$("#remember-login").checked);if(user.mustChange)changePasswordModal(true);}
-        catch(error){const message=$("#login-error");if(message)message.textContent=error.message;}
+        catch(error){const message=$("#login-error");if(message)message.textContent=error.message;const recovery=$('[data-action=request-key-recovery]');if(recovery&&error.code==='KEY_REGISTRATION_CONFLICT')recovery.hidden=false;}
         finally{if(submit.isConnected){submit.disabled=false;submit.textContent=label;}}
         return;
       }
@@ -3548,6 +3563,7 @@
         if(result.error)throw new Error(result.error);
         await network.refresh();
         const response=state.data.mails.find(m=>m.id===id)?.workResponses?.[actor];
+        if(response?.restoreReview)throw new Error(response.restoreReview.message);
         if(response?.sendError)throw new Error('응답은 PC에 저장했지만 전달에 실패했습니다. '+response.sendError.message+' 응답 창에서 다시 저장해 주세요.');
         return {queued:response?.pendingDelivery};
       }

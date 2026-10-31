@@ -19,7 +19,7 @@ test('chunked files resume across lost replies and server/client restart while i
   const downloaded=await receiver.request('/attachment',{mail:mail.id,index:0});assert.equal(downloaded.file.data,undefined);assert.equal(await io.hashFile(receiver.files.path(downloaded.file.localFile)),attachment.sha256);
   assert.equal(sql('SELECT COUNT(*) n FROM relay_blobs')[0].n,1);const dbBackup=path.join(root,'server-backup.sqlite');backup(dbBackup);const {DatabaseSync}=require('node:sqlite'),db=new DatabaseSync(dbBackup);assert.equal(db.prepare('SELECT COUNT(*) n FROM relay_blobs').get().n,0);assert.equal(db.prepare('SELECT COUNT(*) n FROM relay_positions').get().n,0);db.close();
   await send(receiver,'forwarded',[users.c.id],[downloaded.file]);await drain(receiver);await c.request('/bootstrap');assert.equal((await c.request('/attachment',{mail:'forwarded',index:0})).file.sha256,attachment.sha256);
-  advance(10*86400000+1);await receiver.request('/bootstrap');assert.equal(sql('SELECT COUNT(*) n FROM relay_blobs')[0].n,0);assert.equal(fs.readdirSync(path.join(root,'server/relay-files')).length,0);assert.equal((await receiver.request('/attachment',{mail:mail.id,index:0})).file.localFile,downloaded.file.localFile);
+  await advance(10*86400000+1);await receiver.request('/bootstrap');assert.equal(sql('SELECT COUNT(*) n FROM relay_blobs')[0].n,0);assert.equal(fs.readdirSync(path.join(root,'server/relay-files')).length,0);assert.equal((await receiver.request('/attachment',{mail:mail.id,index:0})).file.localFile,downloaded.file.localFile);
 }));
 test('file size and total are enforced before queuing, with image and legacy attachment compatibility',()=>fixture(async({a,b,users})=>{
   await assert.rejects(a.stageAttachment('begin',{name:'too-large.bin',bytes:io.MAX_FILE+1}),/500 MB/);
@@ -89,13 +89,95 @@ test('scheduled disk attachments stay unavailable until dispatch, expire ten day
   const f=await file(a,3*io.CHUNK);await send(a,'scheduled-blob',[users.b.id],[f],{scheduled:new Date(Date.now()+3600000).toISOString()});await drain(a);
   const m=a.store.get('mail-history','scheduled-blob'),cap=m.files[0].relayFile;assert.equal((await call('b','/relay/blob/info',cap)).status,403);assert.equal(sql('SELECT expires_at FROM relay_blobs WHERE id=?',[cap.id])[0].expires_at,0);
   await a.request('/sync',{operations:[{type:'mail.update',id:m.id,recall:true}]});assert.equal(sql('SELECT COUNT(*) n FROM relay_blobs')[0].n,0);assert.equal(fs.readdirSync(path.join(root,'server/relay-files')).length,0);await b.request('/bootstrap');await a.request('/bootstrap');
-  const releaseAt=Date.now()+60000;await send(a,'scheduled-release',[users.b.id],[f],{scheduled:new Date(releaseAt).toISOString()});await drain(a);advance(releaseAt-clock()+1);const r=await b.request('/bootstrap'),mail=r.data.mails.find(m=>m.id==='scheduled-release');assert.ok(mail);assert.equal((await call('b','/relay/blob/info',{...mail.files[0].relayFile,secret:'0'.repeat(64)})).status,403);
-  advance(10*86400000-1);assert.equal((await call('b','/relay/blob/info',mail.files[0].relayFile)).status,200);advance(2);assert.equal((await call('b','/relay/blob/info',mail.files[0].relayFile)).status,410);
+  const releaseAt=Date.now()+60000;await send(a,'scheduled-release',[users.b.id],[f],{scheduled:new Date(releaseAt).toISOString()});await drain(a);await advance(releaseAt-clock()+1);const r=await b.request('/bootstrap'),mail=r.data.mails.find(m=>m.id==='scheduled-release');assert.ok(mail);assert.equal((await call('b','/relay/blob/info',{...mail.files[0].relayFile,secret:'0'.repeat(64)})).status,403);
+  await advance(10*86400000-1);assert.equal((await call('b','/relay/blob/info',mail.files[0].relayFile)).status,200);await advance(2);assert.equal((await call('b','/relay/blob/info',mail.files[0].relayFile)).status,410);
 }));
 test('expired incomplete uploads restart from disk and altered duplicate chunks are rejected',()=>fixture(async({a,users,call,advance})=>{
   const {randomUUID,randomBytes,createHash}=require('node:crypto'),cap={id:randomUUID(),secret:randomBytes(32).toString('hex')},data=Buffer.from('ab'),start={...cap,bytes:data.length,sha256:createHash('sha256').update(data).digest('hex'),mime:'application/octet-stream'};
   assert.equal((await call('a','/relay/blob/start',start)).offset,0);assert.equal((await call('a','/relay/blob/chunk',{...cap,offset:0,data:Buffer.from('a').toString('base64')})).offset,1);
   assert.equal((await call('a','/relay/blob/chunk',{...cap,offset:0,data:Buffer.from('x').toString('base64')})).status,409);
-  advance(86400000+1);assert.equal((await call('a','/relay/blob/start',start)).offset,0);assert.equal((await call('a','/relay/blob/chunk',{...cap,offset:0,data:data.toString('base64')})).offset,2);assert.equal((await call('a','/relay/blob/finish',cap)).ok,true);
+  await advance(86400000+1);assert.equal((await call('a','/relay/blob/start',start)).offset,0);assert.equal((await call('a','/relay/blob/chunk',{...cap,offset:0,data:data.toString('base64')})).offset,2);assert.equal((await call('a','/relay/blob/finish',cap)).ok,true);
 }));
+test('overlapping uploads reserve only unwritten bytes, including after upgrading and restarting',async()=>{
+  const {RESERVE_BYTES}=require('../server/relay-files.cjs'),{randomUUID,randomBytes,createHash}=require('node:crypto');
+  let free=RESERVE_BYTES+1.75*io.CHUNK;
+  await fixture(async({call,root,sql,restart,advance})=>{
+    const start=(bytes)=>({id:randomUUID(),secret:randomBytes(32).toString('hex'),bytes,sha256:createHash('sha256').update(Buffer.alloc(bytes)).digest('hex'),mime:'application/octet-stream'});
+    const names=['a','b'],files=[start(io.CHUNK),start(io.CHUNK)];
+    const replies=await Promise.all(files.map((f,i)=>call(names[i],'/relay/blob/start',f)));
+    assert.deepEqual(replies.map(r=>r.status).sort(),[200,507]);
+    const winner=replies.findIndex(r=>r.status===200),owner=names[winner],f=files[winner],other=files[1-winner];
+    assert.equal(fs.existsSync(path.join(root,'server/relay-files',other.id+'.part')),false);
+    // Power loss between recording the reservation and creating the empty part file.
+    fs.unlinkSync(path.join(root,'server/relay-files',f.id+'.part'));
+    assert.equal((await call(owner,'/relay/blob/start',f)).offset,0);
+    const half=io.CHUNK/2,chunk={...f,offset:0,data:Buffer.alloc(half).toString('base64')};
+    assert.equal((await call(owner,'/relay/blob/chunk',chunk)).offset,half);free-=half;
+    assert.equal((await call(owner,'/relay/blob/start',f)).offset,half);
+    // Simulate a pre-upgrade server with a partial file and no progress column.
+    sql('ALTER TABLE relay_blobs DROP COLUMN received_bytes',[],true);await restart();
+    assert.equal(sql('SELECT received_bytes FROM relay_blobs WHERE id=?',[f.id])[0].received_bytes,half);
+    assert.equal((await call('c','/relay/blob/start',other)).status,507);
+    const fits=start(Math.floor(0.6*io.CHUNK));
+    assert.equal((await call('c','/relay/blob/start',fits)).status,200);
+    free=RESERVE_BYTES;
+    assert.equal((await call(owner,'/relay/blob/chunk',chunk)).offset,half,'already stored chunk is safe to repeat');
+    assert.equal((await call(owner,'/relay/blob/chunk',{...chunk,offset:half})).status,507);
+    assert.equal((await call(owner,'/relay/blob/start',f)).offset,half);
+    await advance(86400001);await call('c','/relay/pull');
+    assert.equal(sql('SELECT count(*) n FROM relay_blobs')[0].n,0);
+    free=RESERVE_BYTES+1.5*io.CHUNK;
+    assert.equal((await call('c','/relay/blob/start',other)).status,200);
+  },{attachmentFreeBytes:()=>free});
+});
+
+test('a disk-full partial write leaves mail usable; manual retry resumes the same attachment exactly once',async()=>{
+  const {RESERVE_BYTES}=require('../server/relay-files.cjs');let free=RESERVE_BYTES+10*io.CHUNK;
+  await fixture(async({a,b,users,root,sql,send:plainSend})=>{
+    const small=await file(a,125),large=await file(a,2*io.CHUNK);
+    await send(a,'accepted-before-shortage',[users.b.id],[small]);await drain(a);
+    const original=io.writeChunk,partial=io.CHUNK+17,serverRoot=path.join(root,'server','relay-files')+path.sep;
+    io.writeChunk=async(dest,offset,data,total)=>{
+      if(dest.startsWith(serverRoot)&&offset===io.CHUNK){
+        await original(dest,offset,data.subarray(0,17),total);free=RESERVE_BYTES;
+        throw Object.assign(Error('fixture disk full'),{code:'ENOSPC'});
+      }
+      return original(dest,offset,data,total);
+    };
+    try{
+      await send(a,'resume-after-space',[users.b.id],[large]);
+      await plainSend(a,'behind-the-upload',[users.b.id]);await drain(a);
+    }finally{io.writeChunk=original;}
+    const failed=a.store.get('mail-history','resume-after-space'),cap=failed.files[0].relayFile;
+    assert.equal(failed.sendError.status,507);assert.match(failed.sendError.message,/서버 저장 공간이 부족/);
+    assert.equal(fs.statSync(path.join(serverRoot,cap.id+'.part')).size,partial);
+    assert.equal((await plainSend(a,'text-while-full',[users.b.id])).delivery['text-while-full'],'sent');
+    const {data}=await b.request('/bootstrap');
+    for(const id of ['behind-the-upload','text-while-full','accepted-before-shortage'])assert.ok(data.mails.some(m=>m.id===id));
+    assert.ok(!data.mails.some(m=>m.id==='resume-after-space'));
+    assert.equal((await b.request('/attachment',{mail:'accepted-before-shortage',index:0})).file.sha256,small.sha256);
+    const inline={name:'작은 그림.png',data:'data:image/png;base64,YQ=='};
+    assert.equal((await send(a,'small-file-while-full',[users.b.id],[inline])).delivery['small-file-while-full'],'failed');
+    assert.equal(a.store.get('mail-history','small-file-while-full').sendError.status,507);
+    free=RESERVE_BYTES+5*io.CHUNK;let resumed;
+    const raw=a.raw;a.raw=async(route,p)=>{const r=await raw(route,p);if(route==='/relay/blob/start'&&p.id===cap.id)resumed=r.offset;return r;};
+    await a.request('/sync',{operations:[{type:'mail.retry',id:failed.id}]});await drain(a);
+    assert.equal(resumed,partial);assert.ok(!a.store.get('mail-history',failed.id).sendError);
+    assert.equal((await b.request('/bootstrap')).data.mails.filter(m=>m.id===failed.id).length,1);
+    assert.equal((await b.request('/attachment',{mail:failed.id,index:0})).file.sha256,large.sha256);
+    assert.equal(sql('SELECT count(*) n FROM relay_blobs WHERE id=?',[cap.id])[0].n,1);
+  },{attachmentFreeBytes:()=>free});
+});
+test('unavailable volume statistics restrict new attachments without blocking reads or text',async()=>{
+  const {RESERVE_BYTES}=require('../server/relay-files.cjs'),{randomUUID,randomBytes}=require('node:crypto');let readable=true;
+  await fixture(async({a,b,users,call,send:plainSend})=>{
+    const cap={id:randomUUID(),secret:randomBytes(32).toString('hex'),data:'data:text/plain;base64,YQ=='};
+    assert.equal((await call('a','/relay/upload',cap)).status,200);readable=false;
+    assert.equal((await call('a','/relay/upload',cap)).status,200,'exact repeat needs no new disk allocation');
+    const blocked=await call('a','/relay/upload',{...cap,id:randomUUID()});
+    assert.equal(blocked.status,507);assert.match(blocked.error,/확인하지 못/);
+    await plainSend(a,'text-without-volume-stats',[users.b.id]);
+    assert.ok((await b.request('/bootstrap')).data.mails.some(m=>m.id==='text-without-volume-stats'));
+  },{attachmentFreeBytes:()=>{if(!readable)throw Error('fixture volume unavailable');return RESERVE_BYTES+io.CHUNK;}});
+});
 module.exports={file,drain,send};

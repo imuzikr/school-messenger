@@ -20,8 +20,8 @@ test('JOSE authenticates content, sender, target set and message identity',async
 });
 
 test('private delivery, PC history and ten-day retention over actual HTTPS',{timeout:180000},async t=>{
-  const root=fs.mkdtempSync(path.join(os.tmpdir(),'dingdong-privacy-test-')),serverDir=path.join(root,'server');let clock=Date.now();
-  let server=await startServer({metadataRelay:false,port:0,host:'127.0.0.1',address:'https://localhost:8443',dataDir:serverDir,now:()=>clock,admin:{username:'admin',password:'Fixture-password-123'},onError:e=>console.error(e)});
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),'dingdong-privacy-test-')),serverDir=path.join(root,'server');let clock=Date.now();const timers=require('./helpers/server-timers.cjs')(()=>clock);
+  let server=await startServer({metadataRelay:false,port:0,host:'127.0.0.1',address:'https://localhost:8443',dataDir:serverDir,now:()=>clock,timers,admin:{username:'admin',password:'Fixture-password-123'},onError:e=>console.error(e)});
   const clients=[],tokens={},users={};
   const call=(user,route,payload)=>new Promise((resolve,reject)=>{
     const raw=payload===undefined?null:JSON.stringify(payload),req=https.request({hostname:'127.0.0.1',port:server.port,path:route,method:raw?'POST':'GET',ca:server.connection.certificate,headers:{...(raw?{'content-type':'application/json','content-length':Buffer.byteLength(raw)}:{}),...(tokens[user]?{authorization:'Bearer '+tokens[user]}:{})}},res=>{let data='';res.on('data',c=>data+=c);res.on('end',()=>resolve({status:res.statusCode,...JSON.parse(data)}));});req.on('error',reject);if(raw)req.write(raw);req.end();
@@ -75,14 +75,15 @@ test('private delivery, PC history and ten-day retention over actual HTTPS',{tim
     assert.equal(query("SELECT count(*) n FROM private_content WHERE id='file'")[0].n,0);
     const file=await r.request('/attachment',{mail:'file',index:0});assert.equal(file.file.data,data);
     assert.equal(query("SELECT data FROM retained_files WHERE mail_id='file'")[0].data,data);
-    const expiry=query("SELECT expires_at FROM retained_files WHERE mail_id='file'")[0].expires_at;clock=expiry-1;
+    const expiry=query("SELECT expires_at FROM retained_files WHERE mail_id='file'")[0].expires_at;clock=expiry-1;await timers.runDue();
     assert.equal((await call('u0','/attachment',{mail:'file',index:0})).status,200);clock=expiry;
     assert.equal((await call('u0','/attachment',{mail:'file',index:0})).status,410);
-    assert.equal(query("SELECT count(*) n FROM retained_files WHERE mail_id='file'")[0].n,0);
+    assert.equal(query("SELECT count(*) n FROM retained_files WHERE mail_id='file'")[0].n,1);
+    clock+=60000;await timers.runDue();assert.equal(query("SELECT count(*) n FROM retained_files WHERE mail_id='file'")[0].n,0);
     assert.equal((await r.request('/attachment',{mail:'file',index:0})).file.data,data);clock=Date.now();
   });
   await t.test('scheduled recipients cannot fetch or ACK early; attachment lifetime starts at scheduled send',async()=>{
-    const scheduled=new Date(Date.now()+86400000).toISOString();await send(a,mail('scheduled',[users.u0.id],{scheduled,files:[{name:'예약.txt',data:'data:text/plain;base64,YQ=='}]}));
+    const scheduled=new Date(Date.now()+90*86400000).toISOString();await send(a,mail('scheduled',[users.u0.id],{scheduled,files:[{name:'예약.txt',data:'data:text/plain;base64,YQ=='}]}));
     assert.ok(!(await call('u0','/bootstrap')).data.mails.some(m=>m.id==='scheduled'));
     const digest=query("SELECT digest FROM private_content WHERE id='scheduled'")[0].digest;
     assert.equal((await call('u0','/privacy/ack',{entries:[{kind:'mail',id:'scheduled',digest}]})).status,403);
@@ -145,17 +146,20 @@ test('private delivery, PC history and ten-day retention over actual HTTPS',{tim
     d.prepare('INSERT INTO mails(id,sender,payload) VALUES(?,?,?)').run('legacy',users.admin.id,JSON.stringify({title:'기존 비공개 제목',body:'기존 비공개 내용',html:'',files:[],date:'2026-10-30',time:'09:00',createdAt:Date.now()}));
     d.prepare('INSERT INTO recipients(mail_id,user_id) VALUES(?,?)').run('legacy',users.u0.id);
     d.prepare('INSERT INTO items VALUES(?,?,?,?)').run('old-note',users.u0.id,'notes',JSON.stringify({text:'기존 개인 메모',date:'2026-10-30',time:'09:00'}));d.close();
-    await server.close();server=await startServer({metadataRelay:false,port:0,host:'127.0.0.1',address:'https://localhost:8443',dataDir:serverDir,now:()=>clock});
+    await server.close();server=await startServer({metadataRelay:false,port:0,host:'127.0.0.1',address:'https://localhost:8443',dataDir:serverDir,now:()=>clock,timers});
     assert.ok(!query("SELECT payload FROM mails WHERE id='legacy'")[0].payload.includes('기존 비공개'));
     const receiver=client('u0'),snapshot=await receiver.request('/bootstrap');assert.equal(snapshot.data.mails.find(m=>m.id==='legacy').body,'기존 비공개 내용');
     assert.equal(snapshot.data.notes.find(n=>n.id==='old-note').text,'기존 개인 메모');assert.equal(query("SELECT count(*) n FROM items WHERE id='old-note'")[0].n,0);
     assert.equal(query("SELECT count(*) n FROM private_content WHERE id='legacy'")[0].n,1);await a.request('/bootstrap');assert.equal(query("SELECT count(*) n FROM private_content WHERE id='legacy'")[0].n,0);
   });
   await t.test('late scheduled dispatch starts a fresh ten-day file lifetime and a recall cancels pending files',async()=>{
-    await send(a,mail('late',[users.u0.id],{scheduled:new Date(Date.now()+86400000).toISOString(),files:[{name:'late.txt',data:'data:text/plain;base64,YQ=='}]}));
-    const d=new DatabaseSync(path.join(serverDir,'dingdong.sqlite')),p=JSON.parse(d.prepare("SELECT payload FROM mails WHERE id='late'").get().payload);p.scheduled=new Date(Date.now()-20*86400000).toISOString();d.prepare("UPDATE mails SET payload=? WHERE id='late'").run(JSON.stringify(p));d.close();
-    const start=Date.now();for(let i=0;i<30&&query("SELECT expires_at FROM retained_files WHERE mail_id='late'")[0].expires_at===0;i++)await new Promise(r=>setTimeout(r,100));
-    const expiry=query("SELECT expires_at FROM retained_files WHERE mail_id='late'")[0].expires_at;assert.ok(expiry>=start+RETENTION&&expiry<=Date.now()+RETENTION);
+    const due=Date.now()+86400000;
+    await send(a,mail('late',[users.u0.id],{scheduled:new Date(due).toISOString(),files:[{name:'late.txt',data:'data:text/plain;base64,YQ=='}]}));
+    await server.close();
+    clock=due+20*86400000;
+    server=await startServer({metadataRelay:false,port:0,host:'127.0.0.1',address:'https://localhost:8443',dataDir:serverDir,now:()=>clock,timers});
+    await timers.runDue();
+    const expiry=query("SELECT expires_at FROM retained_files WHERE mail_id='late'")[0].expires_at;assert.equal(expiry,clock+RETENTION);
     const receiver=client('u0');assert.equal((await receiver.request('/bootstrap')).data.mails.find(m=>m.id==='late').body,'다른 사람이 읽으면 안 되는 본문 late');
     await a.request('/sync',{operations:[{type:'mail.update',id:'scheduled',folder:'sent',recall:true}]});
     assert.equal(query("SELECT count(*) n FROM private_content WHERE id='scheduled'")[0].n,0);

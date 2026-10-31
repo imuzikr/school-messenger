@@ -27,7 +27,7 @@ function context(kind,id,sender,targets,room=''){return {version:1,kind,id,sende
 async function encrypt(content,ctx,identity,publicKeys){
   const j=await jose(), encryptor=new j.GeneralEncrypt(bytes(content)).setProtectedHeader({enc:'A256GCM',typ:'ieum-content-v1'}).setAdditionalAuthenticatedData(bytes(ctx));
   for(const userId of ctx.targets){const key=publicKeys[userId];if(!key)throw new Error('수신자가 아직 암호화 키를 등록하지 않았습니다. 먼저 한 번 로그인해야 합니다.');
-    encryptor.addRecipient(await j.importJWK(key.encryption,'ECDH-ES+A256KW')).setUnprotectedHeader({alg:'ECDH-ES+A256KW',kid:userId});}
+    encryptor.addRecipient(await j.importJWK(key.encryption,'ECDH-ES+A256KW')).setUnprotectedHeader({alg:'ECDH-ES+A256KW',kid:userId,...(key.recovered?{dd_fp:await fingerprint(key)}:{})});}
   const jwe=await encryptor.encrypt();
   return new j.CompactSign(bytes({context:ctx,jwe})).setProtectedHeader({alg:'EdDSA',typ:'ieum-signed-content-v1'}).sign(await j.importJWK(identity.signing,'EdDSA'));
 }

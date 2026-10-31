@@ -18,6 +18,7 @@ const homeroom=require('../js/homeroom.js');
 const workTools=require('../js/work-tools.js');
 const {createPrivacy}=require('./privacy.cjs');
 const {createRelay}=require('./relay.cjs');
+const {diskFull,lowSpace}=require('./relay-files.cjs');
 x509.cryptoProvider.set(crypto.webcrypto);
 const { promisify } = require('node:util');
 const scrypt = promisify(crypto.scrypt);
@@ -71,6 +72,7 @@ async function passwordMatches(password,user) {
   return crypto.timingSafeEqual(Buffer.from(user.digest,'hex'),digest);
 }
 async function startServer(options = {}) {
+  const now=options.now||Date.now,timers=options.timers||require('node:timers');
   const dataDir = path.resolve(options.dataDir || require('../desktop/branding.cjs').serverDirectory(os.homedir()));
   fs.mkdirSync(dataDir,{recursive:true,mode:0o700});
   const port = options.port === undefined ? 8443 : options.port;
@@ -101,6 +103,8 @@ async function startServer(options = {}) {
   CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);
   CREATE INDEX IF NOT EXISTS idx_messages_room ON messages(room_id,seq);
   CREATE INDEX IF NOT EXISTS idx_recipient_user ON recipients(user_id);
+  CREATE INDEX IF NOT EXISTS idx_pending_mail ON recipients(mail_id) WHERE status='scheduled';
+  CREATE INDEX IF NOT EXISTS idx_session_expiry ON sessions(expires);
   CREATE INDEX IF NOT EXISTS idx_members_user ON room_members(user_id);`);
   if(!db.prepare('PRAGMA table_info(bell_schedules)').all().some(c=>c.name==='title'))db.exec("ALTER TABLE bell_schedules ADD COLUMN title TEXT NOT NULL DEFAULT ''");
   const recipientColumns=new Set(db.prepare('PRAGMA table_info(recipients)').all().map(column=>column.name));
@@ -112,8 +116,7 @@ async function startServer(options = {}) {
   if(!columns.has('grade'))db.exec("ALTER TABLE users ADD COLUMN grade TEXT NOT NULL DEFAULT ''");
   if(!columns.has('other_group'))db.exec("ALTER TABLE users ADD COLUMN other_group TEXT NOT NULL DEFAULT ''");
   for(const column of ['class_number','work','special_room','club','position'])if(!columns.has(column))db.exec(`ALTER TABLE users ADD COLUMN ${column} TEXT NOT NULL DEFAULT ''`);
-  const privacy=createPrivacy(db,{allowLegacyMessages:options.allowLegacyMessages===true,now:options.now||Date.now});
-  const relay=options.metadataRelay===false||options.allowLegacyMessages===true?null:createRelay(db,privacy,{now:options.now||Date.now,dataDir});
+  const privacy=createPrivacy(db,{allowLegacyMessages:options.allowLegacyMessages===true,now});
   const existing=db.prepare('SELECT count(*) n FROM users').get().n;
   if(!existing){
     if(!options.admin?.username||!options.admin?.password){db.close();fail(400,'최초 실행에는 관리자 아이디와 비밀번호를 설정해야 합니다.');}
@@ -127,9 +130,40 @@ async function startServer(options = {}) {
   const streams=new Map(), loginAttempts=new Map();
   const userPublic=u=>({id:u.id,username:u.username,name:u.name,department:u.department,role:u.role,subject:u.subject,extension:u.extension,grade:u.grade||'',otherGroup:u.other_group||'',position:u.position||'',classNumber:u.class_number||'',work:u.work||'',specialRoom:u.special_room||'',club:u.club||'',admin:!!u.admin,disabled:!!u.disabled,mustChange:!!u.must_change,status:streams.has(u.id)?'online':'offline'});
   const notify=(audience=null,kind='changed')=>{
-    for(const [userId,connections] of streams){if(audience&&!audience.includes(userId))continue;for(const response of connections)response.write(`event: update\ndata: ${json({kind})}\n\n`);}
+    for(const [userId,connections] of streams){
+      if(audience&&!audience.includes(userId))continue;
+      for(const response of connections)if(!response.writableEnded&&!response.destroyed)response.write(`event: update\ndata: ${json({kind})}\n\n`);
+    }
     options.onChange?.();
   };
+  const relay=options.metadataRelay===false||options.allowLegacyMessages===true?null:createRelay(db,privacy,{now,dataDir,onRelease:notify,freeBytes:options.attachmentFreeBytes});
+  const recovery=relay&&require('./key-recovery.cjs').createKeyRecovery(db,{now,relay});
+  // Earlier clients kept the ISO timestamp in the mail payload. Only join pending IDs.
+  db.exec(`CREATE TEMP VIEW pending_mail_dispatch AS
+    SELECT m.id, round(unixepoch(json_extract(m.payload,'$.scheduled'),'subsec')*1000) AS due
+    FROM (SELECT DISTINCT mail_id FROM recipients WHERE status='scheduled') r JOIN mails m ON m.id=r.mail_id`);
+  const dispatch=require('./dispatch-timer.cjs').createDispatchTimer({now,timers,onError:options.onError,nextDeadline(){
+    const legacy=db.prepare('SELECT MIN(due) AS at FROM pending_mail_dispatch').get().at;
+    const packet=relay?.nextDeadline()??null;
+    return legacy===null?packet:packet===null?legacy:Math.min(legacy,packet);
+  },releaseDue(){
+    relay?.releaseDue();
+    const rows=db.prepare('SELECT m.* FROM pending_mail_dispatch p JOIN mails m ON m.id=p.id WHERE p.due<=?').all(now());
+    let changed=false,firstError;
+    for(const row of rows){
+      const targets=db.prepare("SELECT user_id FROM recipients WHERE mail_id=? AND status='scheduled'").all(row.id).map(r=>r.user_id);
+      db.exec('BEGIN IMMEDIATE');
+      try{
+        db.prepare("UPDATE recipients SET status='unread' WHERE mail_id=? AND status='scheduled'").run(row.id);
+        privacy.releaseFiles(row.id,now());
+        registerDeadlines('mail',row.id,row.sender,targets,parse(row.payload));
+        db.exec('COMMIT');
+        changed=true;
+      }catch(error){db.exec('ROLLBACK');firstError??=error;}
+    }
+    if(changed)notify();
+    if(firstError)throw firstError;
+  }});
   const roomUsers=room=>db.prepare('SELECT user_id FROM room_members WHERE room_id=?').all(room).map(r=>r.user_id);
   const member=(user,room)=>{const row=db.prepare('SELECT * FROM room_members WHERE room_id=? AND user_id=?').get(room,user.id);if(!row)fail(403,'이 대화방의 참여자만 이용할 수 있습니다.');return row;};
   const knownUsers=(ids)=>{
@@ -492,7 +526,7 @@ async function startServer(options = {}) {
   const server=https.createServer({key:tls.key,cert:tls.cert,minVersion:'TLSv1.2'},async(req,res)=>{
     try{
       const url=new URL(req.url,'https://localhost');const route=url.pathname;
-      if(route==='/health'&&req.method==='GET'){send(res,200,{ok:true,version:'0.2.130',messagePrivacy:relay?2:1});return;}
+      if(route==='/health'&&req.method==='GET'){send(res,200,{ok:true,version:require('../package.json').version,messagePrivacy:relay?2:1});return;}
       if(route==='/login'&&req.method==='POST'){
         const payload=await body(req),username=str(payload.username,40),key=(req.socket.remoteAddress||'')+':'+username,attempt=loginAttempts.get(key);
         if(attempt&&attempt.until>Date.now()&&attempt.count>=8)fail(429,'로그인 시도가 많습니다. 15분 후 다시 시도해 주세요.');
@@ -521,6 +555,19 @@ async function startServer(options = {}) {
         send(res,200,{user:userPublic(user)});return;
       }
       if(route==='/privacy/register'&&req.method==='POST'){send(res,200,await privacy.register(user,await body(req)));return;}
+      if(recovery&&route==='/privacy/recovery'&&req.method==='POST'){
+        send(res,200,await recovery.request(user,await body(req),()=>authentication(req)));return;
+      }
+      if(recovery&&route==='/admin/key-recovery'&&req.method==='POST'){
+        if(!user.admin||!['127.0.0.1','::1','::ffff:127.0.0.1'].includes(req.socket.remoteAddress))fail(403,'서버 PC에서 관리자 계정으로 승인해 주세요.');
+        const p=await body(req);
+        if(!await passwordMatches(p.password,user))fail(403,'관리자 비밀번호를 확인해 주세요.');
+        if(authentication(req).digest!==user.digest)fail(401,'관리자 계정이 변경되었습니다. 다시 로그인해 주세요.');
+        const result=recovery.approve(user,p);
+        dispatch.refresh();relay.checkpoint();
+        for(const stream of streams.get(p.id)||[])stream.end();
+        notify();send(res,200,result);return;
+      }
       if(route==='/privacy/keys'&&req.method==='GET'){send(res,200,{keys:privacy.keys()});return;}
       if(route==='/privacy/localize'&&req.method==='POST'){const p=await body(req);db.exec('BEGIN IMMEDIATE');try{privacy.localize(user,p.entries);db.exec('COMMIT');}catch(e){db.exec('ROLLBACK');throw e;}privacy.checkpoint();send(res,200,{ok:true});return;}
       if(route==='/privacy/ack'&&req.method==='POST'){
@@ -531,15 +578,22 @@ async function startServer(options = {}) {
         if(route==='/relay/pull'&&req.method==='GET'){send(res,200,relay.pull(user,Number(url.searchParams.get('after')||0)));return;}
         if(req.method==='POST'){
           const p=await body(req);let result;
-          if(route==='/relay/send'){result=await relay.send(user,p);notify(p.context.targets);}
+          if(route==='/relay/send'){
+            result=await relay.send(user,p);
+            if(!result.duplicate){
+              if(!result.released)dispatch.refresh();
+              notify(result.released?p.context.targets:[user.id]);
+            }
+          }
           else if(route.startsWith('/relay/blob/'))result=await relay.blobs.handle(user,route.slice('/relay/blob/'.length),p);
           else if(route==='/relay/upload')result=relay.upload(user,p);
           else if(route==='/relay/file')result=relay.file(user,p);
           else if(route==='/relay/ack')result=relay.ack(user,p);
-          else if(route==='/relay/cancel')result=relay.cancel(user,p);
+          else if(route==='/relay/cancel'){result=relay.cancel(user,p);dispatch.refresh();}
           else if(route==='/relay/migrate')result=relay.migrate(user,p);
           else fail(404,'요청한 전달 기능을 찾을 수 없습니다.');
-          relay.checkpoint();send(res,200,result);return;
+          if(['/relay/send','/relay/ack','/relay/cancel','/relay/migrate'].includes(route))relay.checkpoint();
+          send(res,200,result);return;
         }
       }
       if(route==='/bootstrap'&&req.method==='GET'){const result=bootstrap(user,url.searchParams.has('privacy'));send(res,200,relay?relay.decorate(user,result):result);return;}
@@ -574,6 +628,7 @@ async function startServer(options = {}) {
         if(relay&&payload.operations.some(o=>/^(mail\.|message\.|room\.|homeroom\.|item\.|deadline\.)/.test(o.type)||o.type==='event.upsert'&&(o.value?.noticeMail||o.value?.deliveryMail||o.value?.source||o.value?.type==='personal')))fail(409,'PC 보관 방식으로 업데이트한 띵동 앱에서 이용해 주세요.');
         const operations=await privacy.prepare(user,payload.operations);
         db.exec('BEGIN IMMEDIATE');try{for(const op of operations)operation(user,op);reconcileExchanges();db.exec('COMMIT');}catch(error){db.exec('ROLLBACK');throw error;}
+        if(operations.some(op=>(op.type==='mail.send'&&op.value?.scheduled)||(op.type==='mail.update'&&op.recall)))dispatch.refresh();
         notify();send(res,200,{ok:true});return;
       }
       if(route==='/admin/staff-import'&&req.method==='POST'){
@@ -612,23 +667,33 @@ async function startServer(options = {}) {
         if(p.password){const record=await passwordRecord(p.password);db.prepare('UPDATE users SET digest=?,salt=?,must_change=1 WHERE id=?').run(record.digest,record.salt,p.id);db.prepare('DELETE FROM sessions WHERE user_id=?').run(p.id);for(const stream of streams.get(p.id)||[])stream.end();}notify();send(res,200,{ok:true});return;
       }
       fail(404,'요청한 기능을 찾을 수 없습니다.');
-    }catch(error){if(!res.headersSent)send(res,error.status|| (String(error.message).includes('UNIQUE constraint')?409:500),{error:error.status?error.message:String(error.message).includes('UNIQUE constraint')?'이미 사용 중인 아이디입니다.':'서버에서 요청을 처리하지 못했습니다.'});else res.end();if(!error.status)options.onError?.(error);}
+    }catch(error){
+      if(diskFull(error)&&/^\/relay\/(?:upload|blob\/(?:start|chunk|finish))(?:\?|$)/.test(req.url))error=Object.assign(new Error(lowSpace),{status:507});
+      if(!res.headersSent)send(res,error.status|| (String(error.message).includes('UNIQUE constraint')?409:500),{...(error.code==='RELAY_SEQUENCE_UNCONFIRMED'?{code:error.code}:{}),error:error.status?error.message:String(error.message).includes('UNIQUE constraint')?'이미 사용 중인 아이디입니다.':'서버에서 요청을 처리하지 못했습니다.'});else res.end();if(!error.status)options.onError?.(error);
+    }
   });
   server.requestTimeout=20000;server.headersTimeout=10000;
-  const scheduler=setInterval(()=>{
+  async function maintain(){
+    recovery?.cleanup();
     privacy.cleanup();privacy.checkpoint();
-    if(relay){relay.cleanup();relay.checkpoint();}
-    const rows=db.prepare("SELECT DISTINCT m.* FROM mails m JOIN recipients r ON r.mail_id=m.id WHERE r.status='scheduled'").all();let changed=false;
-    for(const row of rows){if(new Date(parse(row.payload).scheduled).getTime()<=Date.now()){db.exec('BEGIN IMMEDIATE');try{db.prepare("UPDATE recipients SET status='unread' WHERE mail_id=? AND status='scheduled'").run(row.id);privacy.releaseFiles(row.id,Date.now());registerDeadlines('mail',row.id,row.sender,db.prepare("SELECT user_id FROM recipients WHERE mail_id=? AND status='unread'").all(row.id).map(r=>r.user_id),parse(row.payload));db.exec('COMMIT');changed=true;}catch(error){db.exec('ROLLBACK');options.onError?.(error);}}}
-    if(changed)notify();db.prepare('DELETE FROM sessions WHERE expires<=?').run(Date.now());for(const [key,value] of loginAttempts)if(value.until<Date.now())loginAttempts.delete(key);
-  },1000);
-  await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(port,options.host||'0.0.0.0',resolve);}).catch(error=>{clearInterval(scheduler);db.close();throw error;});
+    db.prepare('DELETE FROM sessions WHERE expires<=?').run(Date.now());
+    for(const [key,value] of loginAttempts)if(value.until<=Date.now())loginAttempts.delete(key);
+    if(relay){await relay.cleanup();relay.checkpoint();}
+  }
+  let maintaining=null;
+  const maintenance=timers.setInterval(()=>{
+    maintaining??=maintain().catch(error=>options.onError?.(error)).finally(()=>{maintaining=null;});
+    return maintaining;
+  },60000);
+  function stopTimers(){dispatch.close();timers.clearInterval(maintenance);}
+  dispatch.refresh();
+  await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(port,options.host||'0.0.0.0',resolve);}).catch(async error=>{stopTimers();await maintaining;db.close();throw error;});
   const boundPort=server.address().port;
   const connection={version:1,schoolName:db.prepare("SELECT value FROM metadata WHERE key='schoolName'").get()?.value,url:new URL(address).origin.replace(/:0$/,':'+boundPort),certificate:tls.cert,fingerprint:tls.fingerprint};
   // A port selected by the OS must be reflected in the exported connection file.
   if(port===0)connection.url=`https://${addressURL.hostname}:${boundPort}`;
   fs.writeFileSync(path.join(dataDir,'dingdong-server.json'),json(connection),{mode:0o600});
-  return {port:boundPort,connection,dataDir,stats:()=>({users:db.prepare('SELECT count(*) n FROM users WHERE disabled=0').get().n,online:streams.size,rooms:db.prepare('SELECT count(*) n FROM rooms').get().n,messages:db.prepare('SELECT count(*) n FROM private_content').get().n+(relay?db.prepare('SELECT count(*) n FROM relay_packets').get().n:0)}),backup(destination){db.exec('PRAGMA wal_checkpoint(TRUNCATE)');fs.copyFileSync(databasePath,destination);const backup=new DatabaseSync(destination);try{if(relay){backup.exec('PRAGMA secure_delete=ON; DELETE FROM relay_blobs; DELETE FROM relay_positions; DELETE FROM relay_targets; DELETE FROM relay_packets; DELETE FROM relay_files; DELETE FROM relay_legacy_files; DELETE FROM relay_migrated; DELETE FROM recipients; DELETE FROM mail_work_responses; DELETE FROM homeroom_days; DELETE FROM mails; DELETE FROM reactions; DELETE FROM messages; DELETE FROM room_members; DELETE FROM rooms; DELETE FROM private_deliveries; DELETE FROM auto_deadline_sources;');}backup.exec("PRAGMA secure_delete=ON; DELETE FROM sessions; DELETE FROM private_content; DELETE FROM retained_files; DELETE FROM items; UPDATE mail_work_responses SET note='';");for(const e of backup.prepare('SELECT id,payload FROM events').all()){const value=parse(e.payload);if(value.source||value.type==='personal'||relay&&(value.noticeMail||value.deliveryMail||db.prepare('SELECT payload FROM mails').all().some(m=>parse(m.payload).calendarEvent===e.id)))backup.prepare('DELETE FROM events WHERE id=?').run(e.id);else if(value.noticeMail||value.deliveryMail){value.note='';backup.prepare('UPDATE events SET payload=? WHERE id=?').run(json(value),e.id);}}for(const table of ['mails','messages'])for(const row of backup.prepare('SELECT id,payload FROM '+table).all()){const p=parse(row.payload);for(const k of ['title','body','html','text','reply'])delete p[k];backup.prepare('UPDATE '+table+' SET payload=? WHERE id=?').run(json(p),row.id);}backup.exec('VACUUM;');}finally{backup.close();}},async close(){clearInterval(scheduler);for(const connections of streams.values())for(const res of connections)res.end();await new Promise(resolve=>server.close(resolve));db.close();}};
+  return {port:boundPort,connection,dataDir,stats:()=>({attachmentSpace:relay?.blobs.space(),users:db.prepare('SELECT count(*) n FROM users WHERE disabled=0').get().n,online:streams.size,rooms:db.prepare('SELECT count(*) n FROM rooms').get().n,messages:db.prepare('SELECT count(*) n FROM private_content').get().n+(relay?db.prepare('SELECT count(*) n FROM relay_packets').get().n:0)}),backup(destination){db.exec('PRAGMA wal_checkpoint(TRUNCATE)');fs.copyFileSync(databasePath,destination);const backup=new DatabaseSync(destination);try{if(relay){backup.exec('PRAGMA secure_delete=ON; DELETE FROM relay_send_proofs; DELETE FROM relay_blobs; DELETE FROM relay_positions; DELETE FROM relay_targets; DELETE FROM relay_packets; DELETE FROM relay_files; DELETE FROM relay_legacy_files; DELETE FROM relay_migrated; DELETE FROM recipients; DELETE FROM mail_work_responses; DELETE FROM homeroom_days; DELETE FROM mails; DELETE FROM reactions; DELETE FROM messages; DELETE FROM room_members; DELETE FROM rooms; DELETE FROM private_deliveries; DELETE FROM auto_deadline_sources;');}backup.exec("PRAGMA secure_delete=ON; DELETE FROM sessions; DELETE FROM private_content; DELETE FROM retained_files; DELETE FROM items; UPDATE mail_work_responses SET note='';");for(const e of backup.prepare('SELECT id,payload FROM events').all()){const value=parse(e.payload);if(value.source||value.type==='personal'||relay&&(value.noticeMail||value.deliveryMail||db.prepare('SELECT payload FROM mails').all().some(m=>parse(m.payload).calendarEvent===e.id)))backup.prepare('DELETE FROM events WHERE id=?').run(e.id);else if(value.noticeMail||value.deliveryMail){value.note='';backup.prepare('UPDATE events SET payload=? WHERE id=?').run(json(value),e.id);}}for(const table of ['mails','messages'])for(const row of backup.prepare('SELECT id,payload FROM '+table).all()){const p=parse(row.payload);for(const k of ['title','body','html','text','reply'])delete p[k];backup.prepare('UPDATE '+table+' SET payload=? WHERE id=?').run(json(p),row.id);}backup.exec('VACUUM;');}finally{backup.close();}},async close(){stopTimers();await maintaining;for(const connections of streams.values())for(const res of connections)res.end();await new Promise(resolve=>server.close(resolve));db.close();}};
 }
 module.exports={startServer,passwordRecord};
 

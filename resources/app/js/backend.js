@@ -28,7 +28,7 @@ class DingdongBackend{
  async login(username,password,remember=false){
   this.generation++;clearTimeout(this.loginRetry);this.waitingForServer=false;
   const result=await this.native.request('/login',{username,password,remember});if(result.error)throw new Error(result.error);
-  this.user=result.user;if(!result.user.mustChange){const snapshot=await this.native.request('/bootstrap');if(snapshot.error)throw new Error(snapshot.error);this.activate(snapshot);}
+  this.user=result.user;if(!result.user.mustChange){const snapshot=await this.native.request('/bootstrap');if(snapshot.error)throw Object.assign(new Error(snapshot.error),{code:snapshot.code});this.activate(snapshot);}
   if(result.loginWarning)this.callbacks.loginWarning(result.loginWarning);return result.user;
  }
  async changePassword(current,password){const result=await this.native.request('/password',{current,password});if(result.error)throw new Error(result.error);await this.refresh();if(result.loginWarning)this.callbacks.loginWarning(result.loginWarning);}
@@ -50,7 +50,7 @@ class DingdongBackend{
   return operations;
  }
  sync(data,onResult){if(!this.active)return Promise.resolve(false);const before=this.baseline,snapshot=clone(data),operations=this.diff(before,snapshot);this.baseline=snapshot;if(!operations.length)return Promise.resolve(true);const generation=this.generation;this.pending++;this.callbacks.status('저장 중');
-  const job=this.queue.then(async()=>{if(generation!==this.generation)return false;try{const result=await this.native.request('/sync',{operations});this.lastSyncResult=result;onResult?.(result);if(result.error)throw new Error(result.error);this.callbacks.status(result.publicSave==='pending'?'공용 변경 서버 반영 대기':result.failed?'발송 실패 · 보낸함 확인':result.queued?'PC에 발송 대기 중':'연결됨');return true;}catch(error){if(this.generation===generation){this.generation++;this.baseline=before;this.callbacks.error(error.message);}return false;}}).finally(async()=>{this.pending--;if(!this.pending){clearTimeout(this.refreshTimer);this.refreshTimer=null;await this.refresh();}});this.queue=job.catch(()=>false);return job;
+  const job=this.queue.then(async()=>{if(generation!==this.generation)return false;try{const result=await this.native.request('/sync',{operations});this.lastSyncResult=result;onResult?.(result);if(result.error)throw new Error(result.error);this.callbacks.status(result.publicSave==='pending'?'공용 변경 서버 반영 대기':Object.values(result.delivery||{}).includes('review')?'발송 여부 확인 필요 · 보낸함 확인':result.failed?'발송 실패 · 보낸함 확인':result.queued?'PC에 발송 대기 중':'연결됨');return true;}catch(error){if(this.generation===generation){this.generation++;this.baseline=before;this.callbacks.error(error.message);}return false;}}).finally(async()=>{this.pending--;if(!this.pending){clearTimeout(this.refreshTimer);this.refreshTimer=null;await this.refresh();}});this.queue=job.catch(()=>false);return job;
  }
  scheduleRefresh(delay=0){if(this.refreshTimer||!this.active)return;this.refreshTimer=setTimeout(()=>{this.refreshTimer=null;this.refresh();},delay);}
  async refresh(){if(this.pending||!this.user)return;const generation=this.generation;try{const result=await this.native.request('/bootstrap');if(generation!==this.generation)return;if(result.error){if(result.status===401){this.active=false;this.callbacks.expired();}else this.callbacks.status('연결 확인 필요');return;}this.activate(result);}catch{this.callbacks.status('연결 끊김');}}

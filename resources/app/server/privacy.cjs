@@ -6,6 +6,7 @@ function fail(status,message){const e=new Error(message);e.status=status;throw e
 function createPrivacy(db,{allowLegacyMessages=false,now=Date.now}={}){
   db.exec(`PRAGMA secure_delete=ON; PRAGMA synchronous=FULL;
     CREATE TABLE IF NOT EXISTS privacy_keys(user_id TEXT PRIMARY KEY REFERENCES users(id),public_key TEXT NOT NULL,fingerprint TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS privacy_key_changes(user_id TEXT NOT NULL,old_fingerprint TEXT NOT NULL,new_fingerprint TEXT NOT NULL,approved_by TEXT NOT NULL,changed_at INTEGER NOT NULL,PRIMARY KEY(user_id,old_fingerprint));
     CREATE TABLE IF NOT EXISTS private_content(kind TEXT NOT NULL,id TEXT NOT NULL,sender TEXT NOT NULL,context TEXT NOT NULL,sealed TEXT NOT NULL,digest TEXT NOT NULL,PRIMARY KEY(kind,id));
     CREATE TABLE IF NOT EXISTS private_deliveries(kind TEXT NOT NULL,id TEXT NOT NULL,user_id TEXT NOT NULL,received_at INTEGER,PRIMARY KEY(kind,id,user_id));
     CREATE TABLE IF NOT EXISTS retained_files(mail_id TEXT NOT NULL,idx INTEGER NOT NULL,data TEXT NOT NULL,expires_at INTEGER NOT NULL,PRIMARY KEY(mail_id,idx));
@@ -21,7 +22,7 @@ function createPrivacy(db,{allowLegacyMessages=false,now=Date.now}={}){
   async function register(user,value){
     let publicKey,fingerprint;try{publicKey=await crypto.validatePublic(value);fingerprint=await crypto.fingerprint(publicKey);}catch{fail(400,'암호화 공개키가 올바르지 않습니다.');}
     const old=db.prepare('SELECT fingerprint FROM privacy_keys WHERE user_id=?').get(user.id);
-    if(old&&old.fingerprint!==fingerprint)fail(409,'이 계정은 다른 PC의 암호화 키가 등록되어 있습니다. 기존 PC의 보관 파일을 가져와 주세요. 관리자 비밀번호 초기화로 키를 교체하지 않습니다.');
+    if(old&&old.fingerprint!==fingerprint)fail(409,'이 계정에 다른 PC의 보안 키가 등록되어 있습니다. 보관 파일이 있으면 가져오세요. 기존 PC와 파일을 모두 잃었다면 새 PC에서 보안 키 복구를 요청하세요.');
     db.prepare('INSERT OR IGNORE INTO privacy_keys VALUES(?,?,?)').run(user.id,json(publicKey),fingerprint);return {ok:true,fingerprint};
   }
   async function prepare(user,operations){
@@ -100,7 +101,7 @@ function createPrivacy(db,{allowLegacyMessages=false,now=Date.now}={}){
   }
   function attachment(mail,index){
     const row=db.prepare('SELECT data,expires_at FROM retained_files WHERE mail_id=? AND idx=?').get(mail.id,index);
-    if(!row||row.expires_at&&row.expires_at<=now()){cleanup();fail(410,'보관 기간 10일이 지나 첨부 파일이 삭제되었습니다.');}
+    if(!row||row.expires_at&&row.expires_at<=now())fail(410,'첨부 파일 보관 기간이 끝났습니다.');
     const metadata=parse(mail.payload).files[index];if(!metadata)fail(404,'첨부 파일을 찾을 수 없습니다.');
     return {...metadata,data:row.data};
   }
@@ -152,6 +153,7 @@ function createPrivacy(db,{allowLegacyMessages=false,now=Date.now}={}){
     }
     cleanup();db.exec('COMMIT');
   }catch(e){db.exec('ROLLBACK');throw e;}
-  return {register,prepare,store,packet,beginSnapshot,more:()=>snapshotMore,acknowledgements,files,releaseFiles,cancelScheduledFiles,attachment,cleanup,checkpoint,revoke,deliveryMap,key,personal,localize,keys:()=>Object.fromEntries(db.prepare('SELECT user_id,public_key FROM privacy_keys').all().map(r=>[r.user_id,parse(r.public_key)]))};
+  function keys(){return Object.fromEntries(db.prepare('SELECT k.user_id,k.public_key,EXISTS(SELECT 1 FROM privacy_key_changes c WHERE c.user_id=k.user_id) AS recovered FROM privacy_keys k').all().map(r=>[r.user_id,{...parse(r.public_key),...(r.recovered?{recovered:true}:{})}]));}
+  return {register,prepare,store,packet,beginSnapshot,more:()=>snapshotMore,acknowledgements,files,releaseFiles,cancelScheduledFiles,attachment,cleanup,checkpoint,revoke,deliveryMap,key,personal,localize,keys};
 }
 module.exports={createPrivacy,RETENTION};

@@ -8,7 +8,7 @@ const bell=require('../server/schedule.cjs');
 const clone=v=>JSON.parse(JSON.stringify(v));
 const unique=a=>[...new Set(a)];
 const network=e=>/연결|connection|network|ECONN|timeout|fetch failed/i.test(e.message);
-const transient=e=>network(e)||e.status>=500||[408,425,429].includes(e.status);
+const transient=e=>e.status!==507&&(network(e)||e.status>=500||[408,425,429].includes(e.status));
 const owner=(m,me)=>m.from==='me'?me:m.from;
 const requireThat=(condition,message)=>{if(!condition)throw Object.assign(new Error(message),{code:'DELIVERY_INVALID'});};
 const invalidIncoming=e=>['DELIVERY_INVALID','PEER_KEY_MISSING','PEER_KEY_CHANGED'].includes(e.code)||e instanceof TypeError;
@@ -20,7 +20,7 @@ class PrivateClient extends LegacyClient{
     return super.request(route,payload);
   }
   stageAttachment(action,value){return this.queueTask(()=>{if(action==='begin')return this.files.begin(value);if(action==='chunk')return this.files.chunk(value);if(action==='finish')return this.files.finish(value.localFile);if(action==='cancel')return this.files.cancel(value.localFile);throw Error('지원하지 않는 파일 준비 요청입니다.');});}
-  async api(route,payload){const r=await this.raw(route,payload);if(r.error)throw Object.assign(new Error(r.error),{status:r.status});return r;}
+  async api(route,payload){const r=await this.raw(route,payload);if(r.error)throw Object.assign(new Error(r.error),{status:r.status,code:r.code});return r;}
   stage(action,targets,{releaseAt=0,files=[],pending=null}={}){const id=randomUUID();this.store.put('relay-outbox',id,{action,targets:unique(targets),releaseAt,files,pending,createdAt:Date.now()});return id;}
   async keys(){try{const r=await this.api('/privacy/keys');this.store.put('state','keys',r.keys);return r.keys;}catch(e){if(network(e)&&this.store.get('state','keys'))return this.store.get('state','keys');throw e;}}
   deliveryRecord(p,patch){
@@ -55,11 +55,40 @@ class PrivateClient extends LegacyClient{
         try{
         if(!p.wire){const ctx={...crypto.context('relay',row.id,this.user.id,p.targets),sequence:++sequence,releaseAt:p.releaseAt,files:p.files.map(f=>f.id)};for(const target of ctx.targets)await this.trusted(target,keys);p={...p,wire:{context:ctx,sealed:await crypto.encrypt(p.action,ctx,this.identity,keys)}};this.store.put('relay-outbox',row.id,p);}
         else sequence=Math.max(sequence,p.wire.context.sequence);
-        const accepted=(await this.api('/relay/state')).sequence>=p.wire.context.sequence;
-        if(!accepted){if(!require('./file-transfer.cjs').uploadsReady(this,p.files))return {deferred:true};for(const file of p.files)if(!file.blob)await this.api('/relay/upload',file);await this.api('/relay/send',p.wire);}
-        this.store.transaction(()=>{this.deliveryRecord(p,{pendingDelivery:false,sendError:null});this.store.put('relay-sent',row.id,{sequence:p.wire.context.sequence,digest:crypto.digest(p.wire.sealed),at:Date.now()});this.store.remove('relay-outbox',row.id);});
+        const watermark=(await this.api('/relay/state')).sequence;
+        sequence=Math.max(sequence,watermark);
+        if(watermark<p.wire.context.sequence){
+          if(!require('./file-transfer.cjs').uploadsReady(this,p.files))return {deferred:true};
+          for(const file of p.files)if(!file.blob)await this.api('/relay/upload',file);
+        }
+        const digest=crypto.digest(p.wire.sealed);
+        const receipt=await this.api('/relay/send',{...p.wire,requestProof:true});
+        // Older servers return a bare ok for a new send, but their duplicate response proves only a sequence.
+        if(receipt.ok!==true||((receipt.duplicate||receipt.digest!==undefined)&&receipt.digest!==digest)){
+          throw Object.assign(new Error('이 메시지의 발송 여부를 확인할 수 없습니다. 수신자에게 확인해 주세요.'),{code:'RELAY_SEQUENCE_UNCONFIRMED'});
+        }
+        this.store.transaction(()=>{
+          this.deliveryRecord(p,{pendingDelivery:false,sendError:null,restoreReview:null});
+          this.store.put('relay-sent',row.id,{sequence:p.wire.context.sequence,digest,at:Date.now()});
+          if(receipt.digest)this.store.put('relay-send-ack',digest,digest);
+          this.store.remove('relay-outbox',row.id);
+        });
         for(const file of p.files)this.uploadJobs?.delete(file.id);
-        }catch(e){if(transient(e)||e.status===401)throw e;this.rejectDelivery('relay-outbox',{id:row.id,value:p},e);}
+        }catch(e){
+          if(e.code==='RELAY_SEQUENCE_UNCONFIRMED'){
+            const notice={message:e.message,at:Date.now()};
+            this.store.transaction(()=>{
+              this.deliveryRecord(p,{pendingDelivery:false,sendError:null,restoreReview:notice});
+              this.store.put('restore-review','relay-outbox:'+row.id,{action:p.action,source:'relay-sequence',at:notice.at});
+              this.store.remove('relay-outbox',row.id);
+            });
+            for(const file of p.files)this.uploadJobs?.delete(file.id);
+          }else{
+            if(transient(e)||e.status===401)throw e;
+            this.rejectDelivery('relay-outbox',{id:row.id,value:p},e);
+            for(const file of p.files)this.uploadJobs?.delete(file.id);
+          }
+        }
       }
     }
     if(publicDeferred){this.store.put('state','relay-retry-at',Date.now()+3000);return {deferred:true};}
@@ -74,7 +103,16 @@ class PrivateClient extends LegacyClient{
     const job=randomUUID(),{wire,error,transportKind,...p}=failed;
     this.store.put('relay-outbox',job,{...p,job:undefined,createdAt:Date.now()});this.store.remove('relay-failed','relay-outbox:'+mail.sendError.job);this.saveMail({...mail,relayPacket:job,pendingDelivery:true,sendError:null});
   }
-  async acknowledgeRelay(){for(const kind of ['relay-ack','migration-ack']){const rows=this.store.all(kind);for(let i=0;i<rows.length;i+=300){const batch=rows.slice(i,i+300);await this.api(kind==='relay-ack'?'/relay/ack':'/relay/migrate',{entries:batch.map(r=>r.value)});this.store.transaction(()=>batch.forEach(r=>this.store.remove(kind,r.id)));}}}
+  async acknowledgeRelay(kinds=['relay-ack','migration-ack']){
+    for(const kind of kinds){
+      const rows=this.store.all(kind);
+      for(let i=0;i<rows.length;i+=300){
+        const batch=rows.slice(i,i+300),values=batch.map(r=>r.value);
+        await this.api(kind==='migration-ack'?'/relay/migrate':'/relay/ack',kind==='relay-send-ack'?{entries:[],confirmedSends:values}:{entries:values});
+        this.store.transaction(()=>batch.forEach(r=>this.store.remove(kind,r.id)));
+      }
+    }
+  }
   saveMail(mail){this.store.put('mail-history',mail.id,mail);}
   saveRoom(room){this.store.put('room-history',room.id,room);}
   response(type,mail,target,extra={}){this.stage({type,mail,at:Date.now(),...extra},[target]);}
@@ -135,7 +173,8 @@ class PrivateClient extends LegacyClient{
     this.store.put('incoming-failed',id,{fingerprint,code:error.code||'DELIVERY_INVALID',firstAt:old?.firstAt||Date.now(),lastAt:Date.now()});
   }
   async receiveIsolated(packet,keys){
-    const id=packet.context?.id||crypto.digest(packet),fingerprint=crypto.digest([packet,keys[packet.context?.sender]||null]),old=this.store.get('incoming-failed',id);
+    const sender=packet.context?.sender,id=packet.context?.id||crypto.digest(packet),trust=keys[sender]?.recovered?this.store.get('trust',sender)?.fingerprint:null;
+    const fingerprint=crypto.digest([packet,keys[sender]||null,trust||null]),old=this.store.get('incoming-failed',id);
     if(old?.fingerprint===fingerprint)return;
     try{await this.receiveRelay(packet,keys);this.store.remove('incoming-failed',id);}
     catch(error){if(!invalidIncoming(error))throw error;this.incomingFailure(id,fingerprint,error);}
@@ -200,7 +239,7 @@ class PrivateClient extends LegacyClient{
     result.privacy.more=!!(result.privacy.more||pulled.more);
     // Relay content, receipts and ACKs were committed by receiveRelay; only legacy upgrades need an intermediate view.
     if(this.store.all('outbox').length){this.compose(result);await this.upgradeOutbox();}
-    try{await super.acknowledge();await this.acknowledgeRelay();const rows=this.store.all('localize');for(let i=0;i<rows.length;i+=300){const batch=rows.slice(i,i+300);await this.api('/privacy/localize',{entries:batch.map(r=>r.value)});this.store.transaction(()=>batch.forEach(r=>this.store.remove('localize',r.id)));}const after=await this.flushSafe();result.outgoingPending=!!(outgoing.deferred||after.deferred);}
+    try{await super.acknowledge();await this.acknowledgeRelay();const rows=this.store.all('localize');for(let i=0;i<rows.length;i+=300){const batch=rows.slice(i,i+300);await this.api('/privacy/localize',{entries:batch.map(r=>r.value)});this.store.transaction(()=>batch.forEach(r=>this.store.remove('localize',r.id)));}const after=await this.flushSafe();result.outgoingPending=!!(outgoing.deferred||after.deferred);await this.acknowledgeRelay(['relay-send-ack']);}
     catch(e){if(!network(e)&&e.status!==409&&!(e.status>=500))throw e;result.receiptPending=true;}
     const failed=this.store.all('relay-failed');
     result.publicSaveFailures=failed.filter(row=>row.value.transportKind==='public-outbox').length;
@@ -226,7 +265,7 @@ class PrivateClient extends LegacyClient{
   }
   async sync(payload){
     await this.initialize();if(!this.snapshot)await this.refresh();requireThat(Array.isArray(payload.operations)&&payload.operations.length<=300,'변경 요청을 확인해 주세요.');const publicJob=await this.prepare(payload.operations);this.compose(clone(this.snapshot));const result=await this.flushSafe({force:true});this.compose(clone(this.snapshot));
-    const delivery={};for(const op of payload.operations)if(['mail.send','mail.retry'].includes(op.type)){const id=op.id||op.value.id,m=this.store.get('mail-history',id);delivery[id]=m?.sendError?'failed':m?.pendingDelivery?'queued':'sent';}
+    const delivery={};for(const op of payload.operations)if(['mail.send','mail.retry'].includes(op.type)){const id=op.id||op.value.id,m=this.store.get('mail-history',id);delivery[id]=m?.sendError?'failed':m?.restoreReview?'review':m?.pendingDelivery?'queued':'sent';}
     const outcome={ok:true,queued:!!result.deferred,delivery,failed:Object.values(delivery).filter(s=>s==='failed').length,deliveryFailures:this.store.all('relay-failed').length};
     if(publicJob){
       const rejection=this.store.get('relay-failed','public-outbox:'+publicJob)?.error;

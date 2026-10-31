@@ -1,8 +1,8 @@
 'use strict';
 const fs=require('node:fs'),io=require('../privacy/file-io.cjs');
-async function upload(c,file){
+async function upload(c,file,job){
   const info=file.blob,source=c.files.path(info.localFile),auth={id:file.id,secret:file.secret};
-  const call=async(route,p)=>{if(c.closing||!c.uploadJobs.has(file.id))throw Error('파일 전송을 중지했습니다.');return c.api('/relay/blob/'+route,{...auth,...p});};
+  const call=async(route,p)=>{if(c.closing||c.uploadJobs.get(file.id)!==job)throw Error('파일 전송을 중지했습니다.');return c.api('/relay/blob/'+route,{...auth,...p});};
   const start=await call('start',{bytes:info.bytes,sha256:info.sha256,mime:info.mime});
   if(!Number.isSafeInteger(start.offset)||start.offset<0||start.offset>info.bytes)throw Error('서버 파일 전송 위치가 올바르지 않습니다.');
   let offset=start.offset;
@@ -14,7 +14,7 @@ function uploadsReady(c,files){
   for(const file of files.filter(f=>f.blob)){
     let job=c.uploadJobs.get(file.id);
     if(job?.error){c.uploadJobs.delete(file.id);throw job.error;}
-    if(!job){job={done:false};c.uploadJobs.set(file.id,job);job.promise=upload(c,file).then(()=>{job.done=true;},error=>{job.error=error;}).finally(()=>{if(!c.closing)c.onTransfer({direction:'upload',id:file.id,ready:true});});}
+    if(!job){job={done:false};c.uploadJobs.set(file.id,job);job.promise=upload(c,file,job).then(()=>{job.done=true;},error=>{job.error=error;}).finally(()=>{if(!c.closing)c.onTransfer({direction:'upload',id:file.id,ready:true});});}
     if(!job.done)pending=true;
   }
   return !pending;

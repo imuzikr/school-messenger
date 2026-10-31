@@ -48,6 +48,9 @@ async function main(){
  const connection=JSON.parse(fs.readFileSync(path.join(run,'server-data','dingdong-server.json'),'utf8'));
  const health=await new Promise((resolve,reject)=>{const req=https.get({hostname:'localhost',port,path:'/health',ca:connection.certificate},res=>{let body='';res.on('data',v=>body+=v);res.on('end',()=>resolve(JSON.parse(body)));});req.on('error',reject);});assert.equal(health.version,require('../package.json').version);
  assert.equal(await evaluate('document.title'),'띵동 · 교내 서버');await sleep(200);
+ assert.equal(status.stats.attachmentSpace.reserve,2*1024**3);
+ assert.ok(Number.isFinite(status.stats.attachmentSpace.available));
+ assert.match(await evaluate("document.querySelector('#attachment-space').textContent"),/메시지용 여유 공간/);
  await testStartupSwitch(stderr,evaluate);
  assert.ok(!fs.existsSync(path.join(run,'startup-items')),'server never registers the client shortcut');
  assert.ok(!fs.existsSync(path.join(run,'desktop-items')),'server never creates the client desktop shortcut');

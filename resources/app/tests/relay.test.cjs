@@ -5,8 +5,8 @@ const {DatabaseSync}=require('node:sqlite');
 const {startServer}=require('../server/index.cjs'),{PrivateClient}=require('../desktop/private-client.cjs'),crypto=require('../privacy/crypto.cjs');
 const protector={encrypt:s=>Buffer.from(s),decrypt:b=>b.toString()}; // Test-only; native test covers DPAPI.
 test('metadata relay over real HTTPS and durable PC SQLite',{timeout:240000},async t=>{
-  const root=fs.mkdtempSync(path.join(os.tmpdir(),'dingdong-relay-test-'));let now=Date.now();
-  const server=await startServer({dataDir:path.join(root,'server'),port:0,host:'127.0.0.1',address:'https://localhost:8443',now:()=>now,admin:{username:'admin',password:'Fixture-password-123'},onError:console.error});
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),'dingdong-relay-test-'));let now=Date.now();const timers=require('./helpers/server-timers.cjs')(()=>now);
+  const server=await startServer({dataDir:path.join(root,'server'),port:0,host:'127.0.0.1',address:'https://localhost:8443',now:()=>now,timers,admin:{username:'admin',password:'Fixture-password-123'},onError:console.error});
   const tokens={},users={},clients=[];
   const call=(name,route,payload)=>new Promise((resolve,reject)=>{const body=payload===undefined?null:JSON.stringify(payload),req=https.request({hostname:'127.0.0.1',port:server.port,path:route,method:body?'POST':'GET',ca:server.connection.certificate,headers:{...(body?{'content-type':'application/json','content-length':Buffer.byteLength(body)}:{}),...(tokens[name]?{authorization:'Bearer '+tokens[name]}:{})}},res=>{let text='';res.on('data',c=>text+=c);res.on('end',()=>resolve({status:res.statusCode,...JSON.parse(text)}));});req.on('error',reject);if(body)req.write(body);req.end();});
   const login=await call(null,'/login',{username:'admin',password:'Fixture-password-123'});tokens.a=login.token;users.a=login.user;
@@ -60,11 +60,11 @@ test('metadata relay over real HTTPS and durable PC SQLite',{timeout:240000},asy
   await t.test('files use an independent capability, remain unencrypted, expire at ten days',async()=>{
     const data='data:application/octet-stream;base64,'+Buffer.from('unchanged file bytes').toString('base64');await send(a,mail('file',[users.u0.id],{files:[{name:'비공개 파일 이름.bin',data}]}));await b.request('/bootstrap');await a.request('/bootstrap');const row=sql('SELECT * FROM relay_files')[0],handle=b.store.get('mail-history','file').files[0].relayFile;
     assert.equal(row.data,data);assert.ok(!JSON.stringify(row).includes('비공개'));assert.equal(row.staged_owner,null);assert.equal(count('mails'),0);assert.equal((await call('u1','/relay/file',{id:row.id,secret:'bad'})).status,403);
-    assert.equal((await b.request('/attachment',{mail:'file',index:0})).file.data,data);now=row.expires_at;assert.equal((await call('u0','/relay/file',handle)).status,410);assert.equal(count('relay_files','id=?',row.id),0);assert.equal((await b.request('/attachment',{mail:'file',index:0})).file.data,data);now=Date.now();
+    assert.equal((await b.request('/attachment',{mail:'file',index:0})).file.data,data);now=row.expires_at;await timers.runDue();assert.equal((await call('u0','/relay/file',handle)).status,410);assert.equal(count('relay_files','id=?',row.id),0);assert.equal((await b.request('/attachment',{mail:'file',index:0})).file.data,data);now=Date.now();
   });
   await t.test('scheduled delivery starts file lifetime at actual dispatch and cancels pending files',async()=>{
     const start=Date.now()+86400000;await send(a,mail('schedule',[users.u0.id],{scheduled:new Date(start).toISOString(),files:[{name:'예약.txt',data:'data:text/plain;base64,YQ=='}]}));assert.ok(!(await b.request('/bootstrap')).data.mails.some(m=>m.id==='schedule'));const f=a.store.get('mail-history','schedule').files[0];assert.equal(sql('SELECT expires_at FROM relay_files WHERE id=?',f.relayFile.id)[0].expires_at,0);
-    now=start+5*86400000;await b.request('/bootstrap');assert.equal(sql('SELECT expires_at FROM relay_files WHERE id=?',f.relayFile.id)[0].expires_at,now+10*86400000);await a.request('/bootstrap');now=Date.now();
+    now=start+5*86400000;await timers.runDue();await b.request('/bootstrap');assert.equal(sql('SELECT expires_at FROM relay_files WHERE id=?',f.relayFile.id)[0].expires_at,now+10*86400000);await a.request('/bootstrap');now=Date.now();
     await send(a,mail('cancel',[users.u0.id],{scheduled:new Date(Date.now()+86400000).toISOString(),files:[{name:'취소.txt',data:'data:text/plain;base64,Yg=='}]}));const id=a.store.get('mail-history','cancel').files[0].relayFile.id;await send(a,{type:'mail.update',id:'cancel',recall:true});assert.equal(count('relay_files','id=?',id),0);assert.equal(count('relay_packets','id=?',packet('cancel')),0);
   });
   await t.test('chat metadata, likes, room settings and homeroom actions are local after delivery',async()=>{

@@ -44,7 +44,7 @@ function validateConnection(value){
  return {version:1,url:u.origin,certificate:value.certificate,fingerprint:cert.fingerprint256,schoolName:String(value.schoolName||'우리 학교').slice(0,60)};
 }
 function trustedSender(event){if(!event.senderFrame?.url?.startsWith(APP_ORIGIN+'/'))throw new Error('허용되지 않은 화면 요청입니다.');}
-const expose=(name,handler)=>ipcMain.handle(name,async(event,...args)=>{trustedSender(event);try{return await handler(event,...args);}catch(error){return {error:error.message||'요청을 처리하지 못했습니다.'};}});
+const expose=(name,handler)=>ipcMain.handle(name,async(event,...args)=>{trustedSender(event);try{return await handler(event,...args);}catch(error){return {error:error.message||'요청을 처리하지 못했습니다.',...(error.code==='KEY_REGISTRATION_CONFLICT'?{code:error.code}:{})};}});
 expose('dingdong:capture-screen',async()=>{
  if(process.platform!=='win32')return {manual:true};
  const {spawn}=require('node:child_process');
@@ -66,7 +66,7 @@ const emit=data=>{for(const w of windows)if(!w.isDestroyed())w.webContents.send(
 function request(route,payload,credential=token){return new Promise((resolve,reject)=>{
  if(role==='demo')return reject(new Error('창 체험 데모는 실제 서버에 연결하지 않습니다.'));
  if(!connection)return reject(new Error('관리자에게 받은 서버 연결 파일을 먼저 가져오세요.'));
- if(!/^\/(health|login|logout|session|password|bootstrap(?:\?privacy=[12])?|sync|attachment|message-source|search|privacy\/(register|keys|ack|localize)|relay\/(state|pull(?:\?after=\d+)?|send|upload|file|ack|cancel|migrate|blob\/(start|chunk|finish|info|read))|admin\/users|admin\/user|admin\/staff-import)$/.test(route))return reject(new Error('지원하지 않는 요청입니다.'));
+ if(!/^\/(health|login|logout|session|password|bootstrap(?:\?privacy=[12])?|sync|attachment|message-source|search|privacy\/(register|keys|ack|localize|recovery)|relay\/(state|pull(?:\?after=\d+)?|send|upload|file|ack|cancel|migrate|blob\/(start|chunk|finish|info|read))|admin\/users|admin\/user|admin\/staff-import|admin\/key-recovery)$/.test(route))return reject(new Error('지원하지 않는 요청입니다.'));
  const body=payload===undefined?null:JSON.stringify(payload);const url=new URL(route,connection.url);
  const req=https.request(url,{method:body?'POST':'GET',ca:connection.certificate,minVersion:'TLSv1.2',headers:{...(body?{'content-type':'application/json','content-length':Buffer.byteLength(body)}:{}),...(credential?{authorization:'Bearer '+credential}:{})},timeout:route==='/admin/staff-import'?120000:20000},res=>{let bytes=0,raw='';res.on('data',chunk=>{bytes+=chunk.length;if(bytes>16*1024*1024){res.destroy(new Error('서버 응답이 너무 큽니다.'));return}raw+=chunk});res.on('error',reject);res.on('end',()=>{let result;try{result=JSON.parse(raw);}catch{return reject(new Error('서버 응답을 읽을 수 없습니다.'));}if(res.statusCode>=400){if(res.statusCode===401&&route!=='/login'&&route!=='/session'&&credential&&credential===token){token=null;stopStream();emit({kind:'expired'});}resolve({...result,status:res.statusCode});}else resolve(result);});});
  req.on('timeout',()=>req.destroy(new Error('서버 연결 시간이 초과되었습니다.')));req.on('error',error=>reject(new Error(error.code?.startsWith('CERT')||['DEPTH_ZERO_SELF_SIGNED_CERT','UNABLE_TO_VERIFY_LEAF_SIGNATURE','ERR_TLS_CERT_ALTNAME_INVALID'].includes(error.code)?'서버 인증서를 확인할 수 없습니다. 올바른 연결 파일과 서버 주소를 확인하세요.':'교내 서버에 연결할 수 없습니다. 서버 PC와 네트워크를 확인하세요.')));if(body)req.write(body);req.end();
@@ -198,6 +198,7 @@ expose('dingdong:import',async()=>{if(role==='server')throw new Error('서버 �
  });
 });
 expose('dingdong:request',async(event,route,payload)=>{
+ if(route==='/admin/key-recovery'&&(role!=='server'||event.senderFrame.url!==APP_ORIGIN+'/desktop/admin.html'))throw Error('서버의 교직원 계정 관리 창에서 승인해 주세요.');
  if(route==='/logout')return authChange(async()=>{
   loggingOut=true;
   try{
@@ -247,8 +248,12 @@ expose('dingdong:privacy',async(event,action,value={})=>{
  if(!token||!privateClient||loggingOut)throw new Error('먼저 로그인해 주세요.');
  const client=privateClient;await client.queue;
  if(action==='security')return client.security();
+ if(action==='request-key-recovery')return client.requestKeyRecovery(value.acceptLoss);
  if(action==='retry-incoming')return client.retryIncoming();
- if(action==='verify')return client.verify(value.id,value.fingerprint);
+ if(action==='verify')return client.queueTask(async()=>{
+   const result=await client.verify(value.id,value.fingerprint);
+   client.store.remove('state','relay-pull-after');return result;
+ });
  if(action==='export'){
   const result=await dialog.showSaveDialog(BrowserWindow.fromWebContents(event.sender),{title:'PC 이전 파일 저장',defaultPath:'dingdong-my-history-'+new Date().toISOString().slice(0,10)+'.dingdong',filters:[{name:'띵동 PC 이전 파일',extensions:['dingdong']}]});if(result.canceled)return {canceled:true};
   if(client!==privateClient||!token||loggingOut)throw Error('다시 로그인해 주세요.');

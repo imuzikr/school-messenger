@@ -3,7 +3,7 @@ const crypto=require('../privacy/crypto.cjs');
 const clone=v=>JSON.parse(JSON.stringify(v));
 // A backup is a copy of history, not a command to repeat old network operations.
 // Server transport rows may already have been deleted after successful delivery.
-const transport=new Set(['incoming-failed','relay-outbox','relay-cancel','relay-failed','public-outbox','outbox','pending','ack','relay-ack','migration-ack','localize']);
+const transport=new Set(['incoming-failed','relay-outbox','relay-cancel','relay-failed','public-outbox','outbox','pending','ack','relay-ack','relay-send-ack','migration-ack','localize']);
 async function restore(c,encrypted,password){
   const value=await require('../privacy/archive.cjs').open(encrypted,password);
   return restoreValue(c,value);

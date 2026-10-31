@@ -21,7 +21,8 @@ class PrivateClient{
       this.files.cleanup();
       this.identity=this.store.get('identity','current');
       if(!this.identity){this.identity=await crypto.newIdentity();this.store.put('identity','current',this.identity);}
-      const registered=await this.raw('/privacy/register',crypto.publicIdentity(this.identity));if(registered.error)throw new Error(registered.error);
+      const registered=await this.raw('/privacy/register',crypto.publicIdentity(this.identity));
+      if(registered.error)throw Object.assign(new Error(registered.error),{code:registered.status===409?'KEY_REGISTRATION_CONFLICT':undefined});
       this.initialized=true;
     })();
     this.initializing=attempt;try{await attempt;}finally{if(this.initializing===attempt)this.initializing=null;}
@@ -30,7 +31,7 @@ class PrivateClient{
   async trusted(id,keys){
     const key=keys[id];if(!key)throw Object.assign(new Error('상대방이 아직 암호화 키를 등록하지 않았습니다. 먼저 한 번 로그인해야 합니다.'),{code:'PEER_KEY_MISSING'});
     const fp=await crypto.fingerprint(key),old=this.store.get('trust',id);
-    if(old&&old.fingerprint!==fp)throw Object.assign(new Error('상대방의 보안 번호가 변경되어 송수신을 중단했습니다. 상대방과 보안 번호를 확인해 주세요.'),{code:'PEER_KEY_CHANGED'});
+    if((old&&old.fingerprint!==fp)||(!old&&key.recovered&&id!==this.user.id))throw Object.assign(new Error('상대방의 보안 번호가 변경되었습니다. 설정 → 내 메시지 보관·보안에서 상대방에게 직접 받은 새 번호를 대조해 주세요.'),{code:'PEER_KEY_CHANGED'});
     if(!old)this.store.put('trust',id,{fingerprint:fp,verified:false});return key;
   }
   async flush(){
@@ -217,8 +218,26 @@ class PrivateClient{
     if(route==='/attachment')return this.attachment(payload);
     return this.raw(route,payload);
   }
-  async security(){await this.initialize();const directory=await this.raw('/privacy/keys');return {fingerprint:await crypto.fingerprint(crypto.publicIdentity(this.identity)),people:await Promise.all(Object.entries(directory.keys||{}).map(async([id,key])=>({id,fingerprint:await crypto.fingerprint(key),verified:!!this.store.get('trust',id)?.verified}))),pending:this.store.all('outbox').length,path:this.store.path};}
-  async verify(id,number){const directory=await this.raw('/privacy/keys'),key=await this.trusted(id,directory.keys||{}),fp=await crypto.fingerprint(key);if(fp!==String(number).replace(/[\s:-]/g,'').toLowerCase())throw new Error('상대방의 보안 번호가 일치하지 않습니다.');this.store.put('trust',id,{fingerprint:fp,verified:true});return {ok:true};}
+  async security(){
+    await this.initialize();const directory=await this.raw('/privacy/keys');
+    const people=await Promise.all(Object.entries(directory.keys||{}).map(async([id,key])=>{
+      const fp=await crypto.fingerprint(key),old=this.store.get('trust',id);
+      return {id,fingerprint:fp,verified:!!old?.verified&&old.fingerprint===fp,changed:(!!old&&old.fingerprint!==fp)||(!old&&!!key.recovered)};
+    }));
+    return {fingerprint:await crypto.fingerprint(crypto.publicIdentity(this.identity)),people,pending:this.store.all('outbox').length,path:this.store.path};
+  }
+  async verify(id,number){
+    const directory=await this.raw('/privacy/keys'),key=directory.keys?.[id];
+    if(!key)throw new Error(directory.error||'상대방의 공개키를 찾을 수 없습니다.');
+    const fp=await crypto.fingerprint(key);
+    if(fp!==String(number).replace(/[\s:-]/g,'').toLowerCase())throw new Error('상대방의 보안 번호가 일치하지 않습니다.');
+    this.store.put('trust',id,{fingerprint:fp,verified:true});return {ok:true};
+  }
+  async requestKeyRecovery(acceptLoss){
+    const identity=this.store.get('identity','current');
+    if(!identity||acceptLoss!==true)throw new Error('새 PC에서 계정 로그인을 시도하고 복구 안내를 확인해 주세요.');
+    return this.raw('/privacy/recovery',{key:crypto.publicIdentity(identity),acceptLoss:true});
+  }
   async exportArchive(password){await this.initialize();const archive=await require('../privacy/archive.cjs').seal({version:1,server:this.server,user:this.user.id,records:this.store.export()},password);if(Buffer.byteLength(archive)>256*1024*1024)throw new Error('보관 파일 한도를 초과했습니다. 내려받은 파일을 별도로 보관해 주세요.');return archive;}
   async importArchive(encrypted,password){
     const value=await require('../privacy/archive.cjs').open(encrypted,password);
