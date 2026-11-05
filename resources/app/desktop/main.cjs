@@ -3,8 +3,9 @@ const {app,screen,BrowserWindow,ipcMain,protocol,net:electronNet,dialog,Menu,Tra
 const path=require('node:path');const fs=require('node:fs');const https=require('node:https');const crypto=require('node:crypto');const os=require('node:os');const {pathToFileURL}=require('node:url');
 const ROOT=path.resolve(__dirname,'..');
 const branding=require('./branding.cjs'),APP_ORIGIN=branding.rendererOrigin;
+const {createBodyCollector}=require('./response-body.cjs'),{createEventStream}=require('./event-stream.cjs');
 protocol.registerSchemesAsPrivileged([{scheme:branding.rendererScheme,privileges:{standard:true,secure:true,supportFetchAPI:true}}]);
-let mainWindow,tray,connection,token=null,stream=null,reconnect=null,localServer=null,quitting=false;
+let mainWindow,tray,connection,token=null,localServer=null,quitting=false;
 let privateClient=null,liveUser=null,loggingOut=false;
 const role=branding.roleFor(process.argv,require('../package.json'),process.env,app.isPackaged);
 app.setName(role==='demo'?'DingdongDemo':role==='server'?'DingdongServer':'DingdongClient');
@@ -68,18 +69,12 @@ function request(route,payload,credential=token){return new Promise((resolve,rej
  if(!connection)return reject(new Error('관리자에게 받은 서버 연결 파일을 먼저 가져오세요.'));
  if(!/^\/(health|login|logout|session|password|bootstrap(?:\?privacy=[12])?|sync|attachment|message-source|search|privacy\/(register|keys|ack|localize|recovery)|relay\/(state|pull(?:\?after=\d+)?|send|upload|file|ack|cancel|migrate|blob\/(start|chunk|finish|info|read))|admin\/users|admin\/user|admin\/staff-import|admin\/key-recovery)$/.test(route))return reject(new Error('지원하지 않는 요청입니다.'));
  const body=payload===undefined?null:JSON.stringify(payload);const url=new URL(route,connection.url);
- const req=https.request(url,{method:body?'POST':'GET',ca:connection.certificate,minVersion:'TLSv1.2',headers:{...(body?{'content-type':'application/json','content-length':Buffer.byteLength(body)}:{}),...(credential?{authorization:'Bearer '+credential}:{})},timeout:route==='/admin/staff-import'?120000:20000},res=>{let bytes=0,raw='';res.on('data',chunk=>{bytes+=chunk.length;if(bytes>16*1024*1024){res.destroy(new Error('서버 응답이 너무 큽니다.'));return}raw+=chunk});res.on('error',reject);res.on('end',()=>{let result;try{result=JSON.parse(raw);}catch{return reject(new Error('서버 응답을 읽을 수 없습니다.'));}if(res.statusCode>=400){if(res.statusCode===401&&route!=='/login'&&route!=='/session'&&credential&&credential===token){token=null;stopStream();emit({kind:'expired'});}resolve({...result,status:res.statusCode});}else resolve(result);});});
+ const req=https.request(url,{method:body?'POST':'GET',ca:connection.certificate,minVersion:'TLSv1.2',headers:{...(body?{'content-type':'application/json','content-length':Buffer.byteLength(body)}:{}),...(credential?{authorization:'Bearer '+credential}:{})},timeout:route==='/admin/staff-import'?120000:20000},res=>{const collected=createBodyCollector();res.on('data',chunk=>{if(!collected.push(chunk))res.destroy(new Error('서버 응답이 너무 큽니다.'));});res.on('error',reject);res.on('end',()=>{let result;try{result=JSON.parse(collected.text());}catch{return reject(new Error('서버 응답을 읽을 수 없습니다.'));}if(res.statusCode>=400){if(res.statusCode===401&&route!=='/login'&&route!=='/session'&&credential&&credential===token){token=null;stopStream();emit({kind:'expired'});}resolve({...result,status:res.statusCode});}else resolve(result);});});
  req.on('timeout',()=>req.destroy(new Error('서버 연결 시간이 초과되었습니다.')));req.on('error',error=>reject(new Error(error.code?.startsWith('CERT')||['DEPTH_ZERO_SELF_SIGNED_CERT','UNABLE_TO_VERIFY_LEAF_SIGNATURE','ERR_TLS_CERT_ALTNAME_INVALID'].includes(error.code)?'서버 인증서를 확인할 수 없습니다. 올바른 연결 파일과 서버 주소를 확인하세요.':'교내 서버에 연결할 수 없습니다. 서버 PC와 네트워크를 확인하세요.')));if(body)req.write(body);req.end();
  });}
-function stopStream(){clearTimeout(reconnect);reconnect=null;if(stream){stream.destroy();stream=null;}}
-function connectStream(){
- stopStream();if(!token||!connection)return;let activeToken=token;
- const req=https.get(new URL('/events',connection.url),{ca:connection.certificate,headers:{authorization:'Bearer '+token},minVersion:'TLSv1.2'},res=>{
-  if(res.statusCode!==200){if(res.statusCode===401&&token===activeToken){token=null;emit({kind:'expired'});}res.resume();return;}
-  emit({kind:'connected'});let raw='';res.setEncoding('utf8');res.on('data',chunk=>{raw+=chunk;let at;while((at=raw.indexOf('\n\n'))>=0){const frame=raw.slice(0,at);raw=raw.slice(at+2);const data=frame.split('\n').find(line=>line.startsWith('data: '));if(data){try{emit(JSON.parse(data.slice(6)));}catch{}}}if(raw.length>100000)raw='';});res.on('error',()=>{});res.on('end',retry);
- });stream=req;req.on('error',retry);
- function retry(){if(activeToken!==token||!token)return;emit({kind:'disconnected'});if(!reconnect)reconnect=setTimeout(()=>{reconnect=null;connectStream()},3000);}
-}
+const eventStream=createEventStream({emit:data=>emit(data),current:()=>({token,connection}),expired:()=>{token=null;emit({kind:'expired'});}});
+function stopStream(){eventStream.stop();}
+function connectStream(){eventStream.start();}
 function createWindow(url,options={}){
  const window=new BrowserWindow({width:options.width||430,height:options.height||830,minWidth:options.minWidth||390,minHeight:600,show:false,frame:false,backgroundColor:'#f6f8f4',title:'띵동',...options,webPreferences:{preload:path.join(__dirname,'preload.cjs'),additionalArguments:[...(role==='demo'?['--dingdong-demo']:[]),...(options.mainHost?['--dingdong-main-host','--dingdong-wing-width='+TODAY_WIDTH]:[])],contextIsolation:true,nodeIntegration:false,sandbox:true,webSecurity:true}});
  windows.add(window);window.once('ready-to-show',()=>{window.show();});window.on('closed',()=>windows.delete(window));
