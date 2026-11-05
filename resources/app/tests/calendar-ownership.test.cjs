@@ -62,10 +62,14 @@ test('recalling a mail that only names the recipient\'s entry leaves that entry 
 test('a lesson notice cannot replace an entry through a chosen mail id',()=>fixture(async({b,users,deliver,forgedMail})=>{
   const plan=personal('forged-notice-p3','보강 충돌 개인 일정');
   assert.equal((await b.request('/sync',{operations:[{type:'event.upsert',value:plan}]})).ok,true);
-  await deliver(forgedMail('forged-notice',{notice:{kind:'makeup',date:DATE,rows:[{period:3,teacher:users.b.id,className:''}]}}));
+  // Period 4 does not collide, so it proves notice entries are actually being created.
+  await deliver(forgedMail('forged-notice',{notice:{kind:'makeup',date:DATE,rows:[{period:3,teacher:users.b.id,className:''},{period:4,teacher:users.b.id,className:''}]}}));
   let r=await b.request('/bootstrap');assert.ok(r.data.mails.some(m=>m.id==='forged-notice'));assertIntact(b,r,plan);
+  const created=b.store.get('local-events','forged-notice-p4');
+  assert.ok(created&&!created.deleted,'the non-conflicting notice entry is created');assert.equal(created.owner,users.a.id);assert.equal(created.noticeMail,'forged-notice');
   await deliver({type:'mail.recall',mail:'forged-notice',at:Date.now()});
   r=await b.request('/bootstrap');assertIntact(b,r,plan);
+  assert.equal(b.store.get('local-events','forged-notice-p4').deleted,true,'the sender\'s own notice entry is removed by the recall');
 }));
 test('the sender can still share, update and recall their own calendar entry',()=>fixture(async({a,b,c,users,mailOp})=>{
   const shared={id:'shared-plan',title:'함께 볼 일정',date:DATE,start:'13:00',end:'14:00',type:'group',targets:[users.b.id],note:'공유 메모',place:''};

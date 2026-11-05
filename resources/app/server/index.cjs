@@ -535,11 +535,13 @@ async function startServer(options = {}) {
       if(route==='/login'&&req.method==='POST'){
         const payload=await body(req),username=str(payload.username,40),address=req.socket.remoteAddress||'',key=address+':'+username,started=Date.now();
         let attempt=loginAttempts.get(key);
-        if(!attempt||attempt.until<=started){attempt={count:0,until:started+LOGIN_WINDOW_MS};loginAttempts.set(key,attempt);}
-        if(attempt.count>=LOGIN_LIMIT)fail(429,'로그인 시도가 많습니다. 15분 후 다시 시도해 주세요.');
+        if(attempt&&attempt.until<=started)attempt=null;
+        if(attempt&&attempt.count>=LOGIN_LIMIT)fail(429,'로그인 시도가 많습니다. 15분 후 다시 시도해 주세요.');
         const active=loginChecks.get(address)||0;
         if(active>=LOGIN_CHECKS_PER_ADDRESS)fail(429,'로그인 요청이 많습니다. 잠시 후 다시 시도해 주세요.');
         // Reserve the attempt before the slow password check, so parallel requests cannot exceed the limit.
+        // Requests turned away above leave no record, so a flood cannot grow the map faster than checks run.
+        if(!attempt){attempt={count:0,until:started+LOGIN_WINDOW_MS};loginAttempts.set(key,attempt);}
         attempt.count++;loginChecks.set(address,active+1);
         let user,matched=false;
         try{
