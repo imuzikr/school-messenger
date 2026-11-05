@@ -132,6 +132,8 @@ class PrivateClient extends LegacyClient{
       if(this.store.get('recall-before-mail',actor+':'+v.id))return true;
       const fields=this.privateFields('mail',v);this.store.put('content','mail:'+v.id,fields);
       const mail={...v,from:actor===me?'me':actor,folder:actor===me?'sent':'inbox',previousFolder:actor===me?'sent':'inbox',unread:actor!==me,canRecall:actor===me,scheduled:'',receipts:v.to.map(()=> 'unread'),storedReceipts:{[actor]:v.createdAt},workDelivery:Object.fromEntries(v.to.map(id=>[id,'unread'])),workResponses:{},homeroomDays:[],relayPacket:ctx.id};
+      // A calendar link that would take over another person's entry is dropped; the mail itself is still delivered.
+      if((mail.calendarEvent!==undefined||mail.calendarDetails!==undefined)&&!this.sharedCalendar(mail,actor)){delete mail.calendarEvent;delete mail.calendarDetails;}
       this.saveMail(mail);this.mailEvents(mail);if(actor!==me)this.response('receipt.delivery',mail.id,actor);
     }else if(action.type==='room.create'){
       const r=action.value;requireThat(r&&typeof r.id==='string'&&typeof r.name==='string'&&Array.isArray(r.members)&&r.members.includes(actor)&&r.members.includes(me),'대화방 정보가 올바르지 않습니다.');
@@ -151,7 +153,8 @@ class PrivateClient extends LegacyClient{
       msg.likesBy=unique([...(msg.likesBy||[]).filter(id=>id!==actor),...(action.liked?[actor]:[])]);msg.likes=msg.likesBy.length;msg.liked=msg.likesBy.includes(me);this.saveRoom(room);this.store.put('relay-revision',key,ctx.sequence);
     }else if(action.type==='mail.recall'){
       requireThat(owner(m,me)===actor,'발신자만 회수를 요청할 수 있습니다.');const recalled=m.unread||this.store.get('recalled',m.id);
-      if(recalled){this.store.put('recalled',m.id,true);for(const row of this.store.all('local-events'))if(row.value.noticeMail===m.id||row.value.deliveryMail===m.id||row.id===m.calendarEvent)this.store.put('local-events',row.id,{deleted:true});}
+      // Only entries this sender owns and linked to this mail are removed; the tombstone keeps its owner.
+      if(recalled){this.store.put('recalled',m.id,true);for(const row of this.store.all('local-events')){const e=row.value;if(!e.deleted&&(e.owner||me)===actor&&(e.noticeMail===m.id||e.deliveryMail===m.id||(row.id===m.calendarEvent&&!e.deliveryMail)))this.store.put('local-events',row.id,{...e,deleted:true});}}
       this.response('receipt.recall',m.id,actor,{recalled:!!recalled});
     }else if(['receipt.delivery','receipt.read','work.response','receipt.recall'].includes(action.type)){
       requireThat(owner(m,me)===me&&m.to.includes(actor),'원 메시지의 수신자가 보낸 알림이 아닙니다.');const key=action.type+':'+m.id+':'+actor;if((this.store.get('relay-revision',key)||0)>=ctx.sequence)return true;
@@ -195,11 +198,25 @@ class PrivateClient extends LegacyClient{
     // Content, metadata, subsequent receipt, deduplication and ACK commit together.
     this.store.transaction(()=>{this.apply(action,ctx);if(action.type==='mail.create'){const mail=this.store.get('mail-history',action.value.id);if(mail){for(const f of mail.files)if(packet.fileExpiry?.[f.relayFile?.id])f.expiresAt=packet.fileExpiry[f.relayFile.id];this.saveMail(mail);}}this.store.put('relay-seen',ctx.id,packet.digest);this.store.put('relay-ack',ctx.id,{id:ctx.id,digest:packet.digest});});
   }
+  // Owner of an existing calendar entry on this PC, or null when the id is free.
+  // Entries without an owner were created on this PC and belong to this user.
+  calendarOwner(id){
+    const local=this.store.get('local-events',id);
+    if(local&&!(local.deleted&&!local.owner))return local.owner||this.user.id;
+    const existing=[this.currentData?.events,this.snapshot?.data?.events].flatMap(list=>Array.isArray(list)?list:[]).find(e=>e?.id===id);
+    return existing?existing.owner||this.user.id:null;
+  }
+  // A mail may create or refresh only a new entry or one that already belongs to its sender.
+  mayPlaceEvent(id,sender){const current=this.calendarOwner(id);return current===null||current===sender;}
+  sharedCalendar(mail,sender){
+    const e=mail.calendarDetails;
+    return !!e&&typeof e==='object'&&!Array.isArray(e)&&typeof e.id==='string'&&e.id.length>0&&e.id.length<=100&&e.id===mail.calendarEvent&&this.mayPlaceEvent(e.id,sender);
+  }
   mailEvents(mail){
-    const me=this.user.id,sender=owner(mail,me);if(mail.calendarDetails){const e=mail.calendarDetails;this.store.put('local-events',e.id,{...e,owner:sender,targets:mail.to,deliveryMail:mail.id,readonly:sender!==me,canReschedule:true});}
+    const me=this.user.id,sender=owner(mail,me);if(mail.calendarDetails&&this.sharedCalendar(mail,sender)){const e=mail.calendarDetails;this.store.put('local-events',e.id,{...e,owner:sender,targets:mail.to,deliveryMail:mail.id,readonly:sender!==me,canReschedule:true});}
     if(mail.notice)for(const row of mail.notice.rows){const targets=unique([row.teacher,row.originalTeacher,row.homeroomTeacher].filter(Boolean));if(sender!==me&&!targets.includes(me))continue;
       const data=this.currentData||this.snapshot?.data,periods=data?.bellSchedules?.find(s=>s.date===mail.notice.date)?.periods||data?.defaultPeriods||bell.defaults(),slot=periods.find(p=>p.period===Number(row.period));if(!slot)continue;
-      const e={id:mail.id+'-p'+row.period,title:`${mail.notice.kind==='makeup'?'보강 안내':'수업 변경 안내'} · ${row.period}교시${row.className?' · '+row.className:''}`,date:mail.notice.date,start:slot.start,end:slot.end,type:mail.notice.kind,period:Number(row.period),targets,note:mail.body.slice(0,1000),place:row.className,assignment:row,noticeMail:mail.id,owner:sender,readonly:sender!==me,canReschedule:false};this.store.put('local-events',e.id,e);
+      const e={id:mail.id+'-p'+row.period,title:`${mail.notice.kind==='makeup'?'보강 안내':'수업 변경 안내'} · ${row.period}교시${row.className?' · '+row.className:''}`,date:mail.notice.date,start:slot.start,end:slot.end,type:mail.notice.kind,period:Number(row.period),targets,note:mail.body.slice(0,1000),place:row.className,assignment:row,noticeMail:mail.id,owner:sender,readonly:sender!==me,canReschedule:false};if(this.mayPlaceEvent(e.id,sender))this.store.put('local-events',e.id,e);
     }
   }
   async migrate(result){
@@ -210,7 +227,8 @@ class PrivateClient extends LegacyClient{
         if(token.kind==='mail'&&!token.recalled){const value=data.mails.find(m=>m.id===token.id);if(!value)continue;const mail=await super.receive('mail',value,keys);let complete=!!this.store.get('content','mail:'+mail.id)&&!value.contentPending;
           for(const [sender,response] of Object.entries(mail.workResponses||{}))if(response.responseId){const d=await super.receive('response',{...response,id:response.responseId,sender},keys,mail.id);if(!this.store.get('content','response:'+response.responseId)||response.contentPending)complete=false;mail.workResponses[sender]={done:response.done,note:d.note||'',updatedAt:response.updatedAt};}if(!complete)continue;
           mail.files=value.files.map(f=>({...f}));const content=this.store.get('content','mail:'+mail.id);mail.html=content.html||'';delete mail.localOnly;mail.canRecall=mail.from==='me';this.saveMail(mail);
-          for(const event of data.events)if(event.noticeMail===mail.id||event.deliveryMail===mail.id||event.id===mail.calendarEvent)this.store.put('local-events',event.id,{...event,...(mail.calendarDetails&&event.id===mail.calendarEvent?mail.calendarDetails:{})});
+          const mailSender=owner(mail,this.user.id);
+          for(const event of data.events)if(event.owner===mailSender&&(event.noticeMail===mail.id||event.deliveryMail===mail.id||event.id===mail.calendarEvent)&&this.mayPlaceEvent(event.id,mailSender))this.store.put('local-events',event.id,{...event,...(mail.calendarDetails&&event.id===mail.calendarEvent?mail.calendarDetails:{}),id:event.id,owner:event.owner});
         }else if(token.kind==='mail')this.store.put('recalled',token.id,true);
         else{const found=data.rooms.find(r=>r.id===token.id);if(!found)continue;const room=clone(found);let complete=true;for(let i=0;i<room.messages.length;i++){const value=room.messages[i];room.messages[i]=await super.receive('message',value,keys,room.id);if(value.contentPending||!this.store.get('content','message:'+value.id))complete=false;}if(!complete)continue;const old=this.store.get('room-history',room.id),messages=new Map((old?.messages||[]).map(m=>[m.id,m]));for(const m of room.messages)messages.set(m.id,m);room.messages=[...messages.values()];this.saveRoom(room);}
         this.store.put('migrated-local',marker,true);
