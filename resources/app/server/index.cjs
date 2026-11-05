@@ -25,6 +25,11 @@ const scrypt = promisify(crypto.scrypt);
 const SESSION_MS = 12 * 60 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const REMEMBER_MS = 90 * DAY_MS;
+const LOGIN_LIMIT = 8;
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const LOGIN_CHECKS_PER_ADDRESS = 2;
+// Unknown or disabled accounts are checked against this record so they cost the same as real ones.
+const LOGIN_DECOY = {salt: crypto.randomBytes(16).toString('hex'), digest: crypto.randomBytes(64).toString('hex')};
 const id = (prefix) => prefix + '-' + crypto.randomUUID();
 const hash = (value) => crypto.createHash('sha256').update(value).digest('hex');
 const json = (value) => JSON.stringify(value);
@@ -127,7 +132,7 @@ async function startServer(options = {}) {
   const defaultPeriods=()=>parse(db.prepare("SELECT value FROM metadata WHERE key='defaultPeriods'").get()?.value||json(bell.defaults()));
   const periodsFor=date=>{const temporary=db.prepare('SELECT periods FROM bell_schedules WHERE date=?').get(date);return temporary?parse(temporary.periods):defaultPeriods();};
   const resolvePeriod=(date,period)=>{if(!Number.isInteger(Number(period)))fail(400,'수업은 정수 교시로 지정하세요.');const slot=periodsFor(date).find(p=>p.period===Number(period));if(!slot)fail(409,'보강에 지정된 교시가 일과표에 없습니다. 보강 교시를 먼저 변경하세요.');return slot;};
-  const streams=new Map(), loginAttempts=new Map();
+  const streams=new Map(), loginAttempts=new Map(), loginChecks=new Map();
   const userPublic=u=>({id:u.id,username:u.username,name:u.name,department:u.department,role:u.role,subject:u.subject,extension:u.extension,grade:u.grade||'',otherGroup:u.other_group||'',position:u.position||'',classNumber:u.class_number||'',work:u.work||'',specialRoom:u.special_room||'',club:u.club||'',admin:!!u.admin,disabled:!!u.disabled,mustChange:!!u.must_change,status:streams.has(u.id)?'online':'offline'});
   const notify=(audience=null,kind='changed')=>{
     for(const [userId,connections] of streams){
@@ -528,10 +533,23 @@ async function startServer(options = {}) {
       const url=new URL(req.url,'https://localhost');const route=url.pathname;
       if(route==='/health'&&req.method==='GET'){send(res,200,{ok:true,version:require('../package.json').version,messagePrivacy:relay?2:1});return;}
       if(route==='/login'&&req.method==='POST'){
-        const payload=await body(req),username=str(payload.username,40),key=(req.socket.remoteAddress||'')+':'+username,attempt=loginAttempts.get(key);
-        if(attempt&&attempt.until>Date.now()&&attempt.count>=8)fail(429,'로그인 시도가 많습니다. 15분 후 다시 시도해 주세요.');
-        const user=db.prepare('SELECT * FROM users WHERE username=? AND disabled=0').get(username);
-        if(!user||!(await passwordMatches(payload.password,user))){const current=attempt&&attempt.until>Date.now()?attempt:{count:0,until:Date.now()+900000};current.count++;loginAttempts.set(key,current);fail(401,'아이디 또는 비밀번호를 확인해 주세요.');}
+        const payload=await body(req),username=str(payload.username,40),address=req.socket.remoteAddress||'',key=address+':'+username,started=Date.now();
+        let attempt=loginAttempts.get(key);
+        if(!attempt||attempt.until<=started){attempt={count:0,until:started+LOGIN_WINDOW_MS};loginAttempts.set(key,attempt);}
+        if(attempt.count>=LOGIN_LIMIT)fail(429,'로그인 시도가 많습니다. 15분 후 다시 시도해 주세요.');
+        const active=loginChecks.get(address)||0;
+        if(active>=LOGIN_CHECKS_PER_ADDRESS)fail(429,'로그인 요청이 많습니다. 잠시 후 다시 시도해 주세요.');
+        // Reserve the attempt before the slow password check, so parallel requests cannot exceed the limit.
+        attempt.count++;loginChecks.set(address,active+1);
+        let user,matched=false;
+        try{
+          user=db.prepare('SELECT * FROM users WHERE username=? AND disabled=0').get(username);
+          matched=await passwordMatches(payload.password,user||LOGIN_DECOY);
+        }finally{
+          const left=(loginChecks.get(address)||1)-1;
+          if(left>0)loginChecks.set(address,left);else loginChecks.delete(address);
+        }
+        if(!user||!matched)fail(401,'아이디 또는 비밀번호를 확인해 주세요.');
         if(!db.prepare('SELECT 1 FROM users WHERE id=? AND digest=? AND disabled=0').get(user.id,user.digest))fail(401,'계정이 변경되었습니다. 다시 로그인해 주세요.');
         loginAttempts.delete(key);const token=crypto.randomBytes(32).toString('hex'),remembered=payload.remember===true;
         const tokenHash=hash(token);
