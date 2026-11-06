@@ -58,6 +58,24 @@ async function main(){
   const recipient=await http('/login',{username:'receiver',password:'Fixture-native-123'});await http('/password',{current:'Fixture-native-123',password:'Fixture-native-123'},recipient.token);
   const client=new PrivateClient({root:path.join(run,'receiver'),server:server.connection.fingerprint,user:recipient.user,request:(r,p)=>http(r,p,recipient.token),protector:{encrypt:s=>Buffer.from(s),decrypt:b=>b.toString()}});
   await client.initialize();await evaluate("window.dingdongDesktop.request('/bootstrap')");
+  // Presence must update in place, without replacing a focused directory search.
+  const personSelector='.person[data-person="'+created.id+'"]',onlineExpression='document.querySelector('+JSON.stringify(personSelector+' .person-presence')+')?.classList.contains("online")';
+  for(let i=0;i<100&&!await evaluate('!!document.querySelector('+JSON.stringify(personSelector)+')');i++)await sleep(100);
+  await sleep(1200);
+  await evaluate("document.querySelector('[data-action=close-modal]')?.click();true");
+  await evaluate("(()=>{const input=document.querySelector('#people-search');input.value='수신';input.dispatchEvent(new Event('input',{bubbles:true}));input.focus();window.__presenceSearch=input;return true;})()");
+  assert.ok(await evaluate('document.activeElement===window.__presenceSearch'),'directory search is focusable before presence changes');
+  const peerStream=https.get({hostname:'127.0.0.1',port:server.port,path:'/events',ca:server.connection.certificate,headers:{authorization:'Bearer '+recipient.token}},res=>res.resume());peerStream.on('error',()=>{});
+  try{
+    for(let i=0;i<100&&!await evaluate(onlineExpression);i++)await sleep(100);
+    assert.ok(await evaluate(onlineExpression),'peer becomes online');
+    assert.deepEqual(await evaluate("[window.__presenceSearch===document.querySelector('#people-search'),document.activeElement===window.__presenceSearch,document.querySelector('#people-search').value]"),[true,true,'수신'],'presence preserves search node, focus and value');
+    const shot=await command('Page.captureScreenshot',{format:'png'});fs.writeFileSync(path.join(run,'presence-online.png'),Buffer.from(shot.data,'base64'));
+  }finally{peerStream.destroy();}
+  for(let i=0;i<100&&await evaluate(onlineExpression);i++)await sleep(100);
+  assert.equal(await evaluate(onlineExpression),false,'peer becomes offline');
+  assert.ok(await evaluate("window.__presenceSearch===document.querySelector('#people-search') && document.activeElement===window.__presenceSearch"));
+  await evaluate("window.__presenceSearch.value='';window.__presenceSearch.dispatchEvent(new Event('input',{bubbles:true}));true");
   const op={type:'mail.send',value:{id:'native-private-message',title:'PC 보관 시험',body:'서버에서 삭제된 후에도 이 PC에서 볼 수 있습니다.',html:'<p>암호화 송수신 시험</p>',to:[created.id],cc:[],files:[],workRequest:{kind:'submission'}}};
   const sent=await evaluate('window.dingdongDesktop.request("/sync",'+JSON.stringify({operations:[op]})+')');assert.equal(sent.ok,true,JSON.stringify(sent));
   const openMail=async (id,compose=false)=>{

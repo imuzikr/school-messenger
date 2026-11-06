@@ -13,6 +13,7 @@ const owner=(m,me)=>m.from==='me'?me:m.from;
 const requireThat=(condition,message)=>{if(!condition)throw Object.assign(new Error(message),{code:'DELIVERY_INVALID'});};
 const invalidIncoming=e=>['DELIVERY_INVALID','PEER_KEY_MISSING','PEER_KEY_CHANGED'].includes(e.code)||e instanceof TypeError;
 const validateIncoming=fn=>{try{return fn();}catch(e){throw Object.assign(e,{code:'DELIVERY_INVALID'});}};
+const calendarIds=action=>action.type==='calendar.update'?[action.id]:action.type==='mail.create'?[action.value.calendarEvent,...(action.value.notice?.rows||[]).map(row=>action.value.id+'-p'+row.period)].filter(Boolean):[];
 class PrivateClient extends LegacyClient{
   queueTask(fn){const job=this.queue.then(()=>{if(this.closing)throw Error('로그인 상태가 변경되었습니다.');return fn();});this.queue=job.catch(()=>{});return job;}
   request(route,payload){
@@ -49,15 +50,30 @@ class PrivateClient extends LegacyClient{
       catch(e){if(e.status===401)throw e;if(transient(e)){publicDeferred=true;break;}this.rejectDelivery('public-outbox',row,e);}
     }
     const waiting=new Set(this.store.all('public-outbox').flatMap(row=>row.value.schedulePackets||[]));
-    const rows=this.store.all('relay-outbox').filter(row=>!waiting.has(row.id));
+    // A signed packet may already be on the server. Resolve it before assigning
+    // any new sequence, even if an older, unsigned upload has since finished.
+    const rows=this.store.all('relay-outbox').filter(row=>!waiting.has(row.id)).sort((a,b)=>a.value.wire&&b.value.wire?a.value.wire.context.sequence-b.value.wire.context.sequence:Number(!!b.value.wire)-Number(!!a.value.wire));
+    let relayDeferred=false,uploadDeferred=false;const blockedCalendars=new Set();
     if(rows.length){let {sequence}=await this.api('/relay/state');const keys=await this.keys();
       for(const row of rows){let p=row.value;
         try{
+        if(!p.wire){
+          // Keep changes to a shared calendar behind the mail that introduces it.
+          const calendars=calendarIds(p.action);
+          if(calendars.some(id=>blockedCalendars.has(id))){relayDeferred=true;for(const id of calendars)blockedCalendars.add(id);continue;}
+          // Upload one mail's attachments at a time, but let unrelated text and
+          // receipts pass. No sequence is reserved until the files are ready.
+          if((uploadDeferred&&p.files.some(file=>file.blob))||!require('./file-transfer.cjs').uploadsReady(this,p.files)){
+            relayDeferred=true;uploadDeferred=true;for(const id of calendars)blockedCalendars.add(id);continue;
+          }
+        }
         if(!p.wire){const ctx={...crypto.context('relay',row.id,this.user.id,p.targets),sequence:++sequence,releaseAt:p.releaseAt,files:p.files.map(f=>f.id)};for(const target of ctx.targets)await this.trusted(target,keys);p={...p,wire:{context:ctx,sealed:await crypto.encrypt(p.action,ctx,this.identity,keys)}};this.store.put('relay-outbox',row.id,p);}
         else sequence=Math.max(sequence,p.wire.context.sequence);
         const watermark=(await this.api('/relay/state')).sequence;
         sequence=Math.max(sequence,watermark);
         if(watermark<p.wire.context.sequence){
+          // Includes signed uploads left by older clients: do not bypass a
+          // packet whose submission status cannot be safely inferred locally.
           if(!require('./file-transfer.cjs').uploadsReady(this,p.files))return {deferred:true};
           for(const file of p.files)if(!file.blob)await this.api('/relay/upload',file);
         }
@@ -92,7 +108,7 @@ class PrivateClient extends LegacyClient{
       }
     }
     if(publicDeferred){this.store.put('state','relay-retry-at',Date.now()+3000);return {deferred:true};}
-    this.store.remove('state','relay-retry-at');return {deferred:false};
+    this.store.remove('state','relay-retry-at');return {deferred:relayDeferred};
   }
   async flushSafe(options){
     try{return await this.flush(options);}catch(e){if(!transient(e))throw e;this.store.put('state','relay-retry-at',Date.now()+3000);return {deferred:true,error:e.message};}

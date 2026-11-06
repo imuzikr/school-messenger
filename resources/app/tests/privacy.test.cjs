@@ -23,6 +23,7 @@ test('private delivery, PC history and ten-day retention over actual HTTPS',{tim
   const root=fs.mkdtempSync(path.join(os.tmpdir(),'dingdong-privacy-test-')),serverDir=path.join(root,'server');let clock=Date.now();const timers=require('./helpers/server-timers.cjs')(()=>clock);
   let server=await startServer({metadataRelay:false,port:0,host:'127.0.0.1',address:'https://localhost:8443',dataDir:serverDir,now:()=>clock,timers,admin:{username:'admin',password:'Fixture-password-123'},onError:e=>console.error(e)});
   const clients=[],tokens={},users={};
+  t.after(async()=>{for(const c of clients)if(c.store.db)c.close();await server.close();assert.equal(path.dirname(path.resolve(root)),path.resolve(os.tmpdir()));assert.ok(path.basename(root).startsWith('dingdong-privacy-test-'));fs.rmSync(root,{recursive:true,force:true});});
   const call=(user,route,payload)=>new Promise((resolve,reject)=>{
     const raw=payload===undefined?null:JSON.stringify(payload),req=https.request({hostname:'127.0.0.1',port:server.port,path:route,method:raw?'POST':'GET',ca:server.connection.certificate,headers:{...(raw?{'content-type':'application/json','content-length':Buffer.byteLength(raw)}:{}),...(tokens[user]?{authorization:'Bearer '+tokens[user]}:{})}},res=>{let data='';res.on('data',c=>data+=c);res.on('end',()=>resolve({status:res.statusCode,...JSON.parse(data)}));});req.on('error',reject);if(raw)req.write(raw);req.end();
   });
@@ -37,7 +38,6 @@ test('private delivery, PC history and ten-day retention over actual HTTPS',{tim
   const query=(sql,...args)=>{const d=new DatabaseSync(path.join(serverDir,'dingdong.sqlite'));try{return d.prepare(sql).all(...args);}finally{d.close();}};
   const mail=(id,to=[users.u0.id,users.u1.id],extra={})=>({type:'mail.send',value:{id,title:'비밀 제목 '+id,body:'다른 사람이 읽으면 안 되는 본문 '+id,html:'<p>비밀 본문</p>',to,cc:[],files:[],...extra}});
   const send=async(cl,op)=>{const r=await cl.request('/sync',{operations:[op]});assert.equal(r.ok,true,JSON.stringify(r));};
-  t.after(async()=>{for(const c of clients)if(c.store.db)c.close();await server.close();assert.equal(path.dirname(path.resolve(root)),path.resolve(os.tmpdir()));assert.ok(path.basename(root).startsWith('dingdong-privacy-test-'));fs.rmSync(root,{recursive:true,force:true});});
   await t.test('plaintext rejected; body removed only after the final durable receipt; reading is independent',async()=>{
     assert.equal((await call('admin','/sync',{operations:[mail('plaintext')]})).status,400);
     await send(a,mail('group'));

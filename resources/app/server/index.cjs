@@ -134,13 +134,20 @@ async function startServer(options = {}) {
   const resolvePeriod=(date,period)=>{if(!Number.isInteger(Number(period)))fail(400,'수업은 정수 교시로 지정하세요.');const slot=periodsFor(date).find(p=>p.period===Number(period));if(!slot)fail(409,'보강에 지정된 교시가 일과표에 없습니다. 보강 교시를 먼저 변경하세요.');return slot;};
   const streams=new Map(), loginAttempts=new Map(), loginChecks=new Map();
   const userPublic=u=>({id:u.id,username:u.username,name:u.name,department:u.department,role:u.role,subject:u.subject,extension:u.extension,grade:u.grade||'',otherGroup:u.other_group||'',position:u.position||'',classNumber:u.class_number||'',work:u.work||'',specialRoom:u.special_room||'',club:u.club||'',admin:!!u.admin,disabled:!!u.disabled,mustChange:!!u.must_change,status:streams.has(u.id)?'online':'offline'});
-  const notify=(audience=null,kind='changed')=>{
+  const notify=(audience=null,kind='changed',details={})=>{
     for(const [userId,connections] of streams){
       if(audience&&!audience.includes(userId))continue;
-      for(const response of connections)if(!response.writableEnded&&!response.destroyed)response.write(`event: update\ndata: ${json({kind})}\n\n`);
+      for(const response of connections)if(!response.writableEnded&&!response.destroyed)response.write(`event: update\ndata: ${json({kind,...details})}\n\n`);
     }
     options.onChange?.();
   };
+  const presenceEpoch=crypto.randomUUID();let presenceRevision=0,presenceTimer=null,stopping=false;
+  const presenceState=()=>({epoch:presenceEpoch,revision:presenceRevision,online:[...streams.keys()]});
+  function presenceChanged(){
+    presenceRevision++;
+    if(stopping||presenceTimer!==null)return;
+    presenceTimer=timers.setTimeout(()=>{presenceTimer=null;notify(null,'presence',{presence:presenceState()});},100);
+  }
   const relay=options.metadataRelay===false||options.allowLegacyMessages===true?null:createRelay(db,privacy,{now,dataDir,onRelease:notify,freeBytes:options.attachmentFreeBytes});
   const recovery=relay&&require('./key-recovery.cjs').createKeyRecovery(db,{now,relay});
   // Earlier clients kept the ISO timestamp in the mail payload. Only join pending IDs.
@@ -229,7 +236,7 @@ async function startServer(options = {}) {
   const exchangeRequests=()=>db.prepare('SELECT payload FROM duty_exchanges ORDER BY rowid DESC').all().map(r=>parse(r.payload));
   const exchangeEvents=()=>db.prepare('SELECT * FROM events').all().map(r=>({...parse(r.payload),id:r.id,owner:r.owner}));
   const exchangeContext=()=>({people:dutyPeople(),config:dutySettings(),events:exchangeEvents(),requests:exchangeRequests(),today:dateKey(),now:Date.now()});
-  function reconcileExchanges(){const ctx=exchangeContext();for(const [i,r] of exchanges.reconcile(ctx.requests,ctx).entries())if(r!==ctx.requests[i])db.prepare('UPDATE duty_exchanges SET payload=? WHERE id=?').run(json(r),r.id);}
+  function reconcileExchanges(ctx=exchangeContext()){const requests=exchanges.reconcile(ctx.requests,ctx);for(const [i,r] of requests.entries())if(r!==ctx.requests[i])db.prepare('UPDATE duty_exchanges SET payload=? WHERE id=?').run(json(r),r.id);ctx.requests=requests;return ctx;}
   function workMetadata(mail,user,recipients,payload){
     if(!payload.workRequest)return {};
     const rows=db.prepare('SELECT * FROM mail_work_responses WHERE mail_id=?').all(mail.id).filter(r=>mail.sender===user.id||r.user_id===user.id);
@@ -237,6 +244,7 @@ async function startServer(options = {}) {
   }
   function bootstrap(user,searchMode=false){
     privacy.beginSnapshot();
+    const today=dateKey(),config=dutySettings(),allEvents=exchangeEvents();
     const me=value=>value===user.id?'me':value;
     const people=db.prepare('SELECT * FROM users WHERE disabled=0 ORDER BY department,name').all().map(userPublic);
     const rooms=db.prepare('SELECT r.*,m.pinned,m.muted,m.read_seq FROM rooms r JOIN room_members m ON m.room_id=r.id WHERE m.user_id=?').all(user.id).map(r=>{
@@ -245,20 +253,20 @@ async function startServer(options = {}) {
     });
     const mailRows=db.prepare("SELECT * FROM mails WHERE sender=? OR id IN(SELECT mail_id FROM recipients WHERE user_id=? AND status NOT IN('recalled','scheduled'))").all(user.id,user.id);
     const mails=mailRows.map(m=>{const recipients=db.prepare('SELECT * FROM recipients WHERE mail_id=?').all(m.id),mine=m.sender===user.id,r=recipients.find(r=>r.user_id===user.id);const payload=parse(m.payload);const inlineStored=/data:image\/(?:png|jpeg|webp|gif);base64,/.test(payload.html||'');const html=inlineStored?payload.html.replace(/data:image\/(?:png|jpeg|webp|gif);base64,[A-Za-z0-9+/]+={0,2}/g,''):payload.html;return {...payload,...privacy.packet('mail',m.id,user),storedReceipts:privacy.deliveryMap('mail',m.id),...workMetadata(m,user,recipients,payload),html,inlineStored,files:payload.files.map((file,index)=>({...file,expired:!!file.expiresAt&&file.expiresAt<=Date.now(),stored:true,sourceMail:m.id,index})),id:m.id,from:me(m.sender),to:recipients.map(r=>r.user_id),receipts:recipients.map(r=>r.status==='scheduled'?'unread':r.status),folder:mine?m.sender_folder:r.folder,important:!!(mine?m.sender_important:r.important),unread:!mine&&r.status==='unread',eventId:(mine?m.event_id:r.event_id)||null,previousFolder:mine?'sent':'inbox',canRecall:mine,homeroomHidden:!!r?.homeroom_hidden,homeroomDays:db.prepare('SELECT date,hidden,carried_from FROM homeroom_days WHERE mail_id=? AND user_id=? ORDER BY date').all(m.id,user.id).map(d=>({date:d.date,hidden:!!d.hidden,carriedFrom:d.carried_from}))};}).sort((a,b)=>b.createdAt-a.createdAt);
-    const events=db.prepare('SELECT * FROM events').all().filter(e=>{const p=parse(e.payload);return p.duty?(e.owner===user.id||p.targets.includes(user.id)):e.owner===user.id||(['group','makeup','lessonChange'].includes(p.type)&&p.targets.includes(user.id)&&(!(p.noticeMail||p.deliveryMail)||db.prepare("SELECT 1 FROM recipients WHERE mail_id=? AND user_id=? AND status NOT IN('recalled','scheduled')").get(p.noticeMail||p.deliveryMail,user.id)));}).map(e=>({...parse(e.payload),id:e.id,owner:e.owner,readonly:!!parse(e.payload).duty||e.owner!==user.id,canReschedule:(!parse(e.payload).duty||user.admin||dutySettings().managers[parse(e.payload).duty.kind]?.includes(user.id))&&!parse(e.payload).noticeMail&&!['makeup','lessonChange'].includes(parse(e.payload).type)}));
+    const events=allEvents.filter(e=>e.duty?(e.owner===user.id||e.targets.includes(user.id)):e.owner===user.id||(['group','makeup','lessonChange'].includes(e.type)&&e.targets.includes(user.id)&&(!(e.noticeMail||e.deliveryMail)||db.prepare("SELECT 1 FROM recipients WHERE mail_id=? AND user_id=? AND status NOT IN('recalled','scheduled')").get(e.noticeMail||e.deliveryMail,user.id)))).map(e=>({...e,readonly:!!e.duty||e.owner!==user.id,canReschedule:(!e.duty||user.admin||config.managers[e.duty.kind]?.includes(user.id))&&!e.noticeMail&&!['makeup','lessonChange'].includes(e.type)}));
     duties.normalizeTitles(events);
-    reconcileExchanges();const exchangeCtx=exchangeContext(),actor={id:user.id,admin:!!user.admin};
+    const exchangeCtx=reconcileExchanges({people,config,events:allEvents,requests:exchangeRequests(),today,now:now()}),actor={id:user.id,admin:!!user.admin};
     const dutyExchanges=exchangeCtx.requests.filter(r=>exchanges.visible(r,actor,exchangeCtx));
     const notifiedExchanges=new Map(db.prepare('SELECT request_id,version FROM duty_exchange_notices WHERE user_id=?').all(user.id).map(r=>[r.request_id,r.version]));
     const exchangeNotifications=dutyExchanges.filter(r=>notifiedExchanges.get(r.id)!==exchanges.version(r)).slice(0,50);
     const ownKinds=new Set(exchangeCtx.events.filter(e=>e.duty?.assigned.includes(user.id)).map(e=>e.duty.kind));
-    const dutyRoster=exchangeCtx.events.filter(e=>e.duty&&ownKinds.has(e.duty.kind)&&e.date>=dateKey()).map(e=>({id:e.id,title:e.title,date:e.date,start:e.start,end:e.end,duty:e.duty}));
+    const dutyRoster=exchangeCtx.events.filter(e=>e.duty&&ownKinds.has(e.duty.kind)&&e.date>=today).map(e=>({id:e.id,title:e.title,date:e.date,start:e.start,end:e.end,duty:e.duty}));
     // School-wide duty roster contains only assignment metadata, never personal calendar notes or source messages.
     const dutyCalendar=exchangeCtx.events.filter(e=>Object.hasOwn(duties.types,e.duty?.kind)).map(e=>({id:e.id,title:duties.types[e.duty.kind].label,date:e.date,start:e.start,end:e.end,type:'group',owner:e.owner,duty:e.duty,readonly:true,canReschedule:false}));
     const readReceipts=db.prepare("SELECT r.mail_id AS mail,r.user_id AS recipient,r.read_at AS readAt,u.name,m.payload FROM recipients r JOIN mails m ON m.id=r.mail_id JOIN users u ON u.id=r.user_id WHERE m.sender=? AND r.user_id<>m.sender AND r.status='read' AND r.read_at IS NOT NULL AND r.receipt_notified=0 ORDER BY r.read_at,r.mail_id,r.user_id LIMIT 50").all(user.id).map(({payload,...receipt})=>({...receipt,subject:parse(payload).title||'기타'}));
-    const items=db.prepare('SELECT * FROM items WHERE owner=?').all(user.id), data={readReceipts,exchangeNotifications,today:dateKey(),schoolName:db.prepare("SELECT value FROM metadata WHERE key='schoolName'").get()?.value||'우리 학교',people,departments:[...new Set(people.map(p=>p.department))],rooms,mails,events,dutyExchanges,dutyRoster,dutyCalendar,dutySettings:dutySettings(),classTeachers:parse(db.prepare("SELECT value FROM metadata WHERE key='classTeachers'").get()?.value||'[]'),defaultPeriods:defaultPeriods(),bellSchedules:db.prepare('SELECT * FROM bell_schedules ORDER BY date').all().map(row=>({date:row.date,title:row.title,periods:parse(row.periods)})),academic:[],deadlines:[],notes:[],tasks:[],shortcuts:[]};
+    const items=db.prepare('SELECT * FROM items WHERE owner=?').all(user.id), data={readReceipts,exchangeNotifications,today,schoolName:db.prepare("SELECT value FROM metadata WHERE key='schoolName'").get()?.value||'우리 학교',people,departments:[...new Set(people.map(p=>p.department))],rooms,mails,events,dutyExchanges,dutyRoster,dutyCalendar,dutySettings:config,classTeachers:parse(db.prepare("SELECT value FROM metadata WHERE key='classTeachers'").get()?.value||'[]'),defaultPeriods:defaultPeriods(),bellSchedules:db.prepare('SELECT * FROM bell_schedules ORDER BY date').all().map(row=>({date:row.date,title:row.title,periods:parse(row.periods)})),academic:[],deadlines:[],notes:[],tasks:[],shortcuts:[]};
     for(const item of items)data[item.kind].push({...parse(item.payload),id:item.id});
-    return {user:userPublic(user),data,privacy:{version:1,more:privacy.more(),keys:privacy.keys(),fileRetentionDays:10,recalled:db.prepare("SELECT mail_id FROM recipients WHERE user_id=? AND status='recalled'").all(user.id).map(r=>r.mail_id),localRecords:privacy.personal(user),localLedger:db.prepare("SELECT a.* FROM auto_deadline_sources a LEFT JOIN items i ON i.id=a.item_id LEFT JOIN events e ON e.id=a.item_id WHERE i.owner=? OR e.owner=?").all(user.id,user.id)}};
+    return {user:userPublic(user),data,presence:presenceState(),privacy:{version:1,more:privacy.more(),keys:privacy.keys(),fileRetentionDays:10,recalled:db.prepare("SELECT mail_id FROM recipients WHERE user_id=? AND status='recalled'").all(user.id).map(r=>r.mail_id),localRecords:privacy.personal(user),localLedger:db.prepare("SELECT a.* FROM auto_deadline_sources a LEFT JOIN items i ON i.id=a.item_id LEFT JOIN events e ON e.id=a.item_id WHERE i.owner=? OR e.owner=?").all(user.id,user.id)}};
   }
   // Owner-specific extracted copies share a ledger identity except for owner.
   // Update existing copies only: deletion tombstones must not be resurrected.
@@ -266,6 +274,23 @@ async function startServer(options = {}) {
     const ledger=db.prepare('SELECT source_key FROM auto_deadline_sources WHERE item_id=?').get(itemId);
     if(!ledger)return [itemId];const key=parse(ledger.source_key);
     return db.prepare('SELECT source_key,item_id FROM auto_deadline_sources').all().filter(row=>{const k=parse(row.source_key);return k[0]===key[0]&&k[1]===key[1]&&k[3]===key[3];}).map(row=>row.item_id);
+  }
+  function calendarAudience(user,operations){
+    const audience=new Set([user.id]);
+    for(const op of operations){
+      // Duty rosters, extracted copies and other shared settings can affect
+      // more people than the event's participants; retain the full broadcast.
+      if(!['event.upsert','event.reschedule','event.delete'].includes(op.type))return null;
+      const eventId=op.id||op.value?.id;if(typeof eventId!=='string')return null;
+      const old=db.prepare('SELECT owner,payload FROM events WHERE id=?').get(eventId),before=old?parse(old.payload):null;
+      for(const value of [before,op.value]){
+        if(value&&(value.duty||value.source||value.noticeMail||value.deliveryMail))return null;
+        if(value?.targets!==undefined&&(!Array.isArray(value.targets)||value.targets.length>200))return null;
+        for(const id of value?.targets||[])audience.add(id);
+      }
+      if(old)audience.add(old.owner);
+    }
+    return [...audience];
   }
   function operation(user,op){
     if(!op||typeof op.type!=='string')fail(400,'변경 요청이 올바르지 않습니다.');
@@ -630,9 +655,9 @@ async function startServer(options = {}) {
       }
       if(route==='/events'&&req.method==='GET'){
         res.writeHead(200,{'content-type':'text/event-stream','cache-control':'no-store','connection':'keep-alive','x-content-type-options':'nosniff'});res.dingdongToken=user.tokenHash;
-        const connections=streams.get(user.id)||new Set();connections.add(res);streams.set(user.id,connections);res.write('event: ready\ndata: {}\n\n');notify(null,'presence');
+        const wasOnline=streams.has(user.id),connections=streams.get(user.id)||new Set();connections.add(res);streams.set(user.id,connections);if(!wasOnline)presenceChanged();res.write(`event: ready\ndata: ${json({kind:'presence',presence:presenceState()})}\n\n`);
         const heartbeat=setInterval(()=>{if(user.expires<=Date.now()){res.end();return;}res.write(': heartbeat\n\n');},20000);
-        req.on('close',()=>{clearInterval(heartbeat);connections.delete(res);if(!connections.size)streams.delete(user.id);notify(null,'presence');});return;
+        req.on('close',()=>{clearInterval(heartbeat);connections.delete(res);if(!connections.size){streams.delete(user.id);presenceChanged();}});return;
       }
       if(route==='/attachment'&&req.method==='POST'){
         const p=await body(req),mail=db.prepare('SELECT * FROM mails WHERE id=?').get(str(p.mail,100));
@@ -647,9 +672,10 @@ async function startServer(options = {}) {
         const payload=await body(req);if(!Array.isArray(payload.operations)||payload.operations.length>300)fail(400,'변경 요청은 300개까지 가능합니다.');
         if(relay&&payload.operations.some(o=>/^(mail\.|message\.|room\.|homeroom\.|item\.|deadline\.)/.test(o.type)||o.type==='event.upsert'&&(o.value?.noticeMail||o.value?.deliveryMail||o.value?.source||o.value?.type==='personal')))fail(409,'PC 보관 방식으로 업데이트한 띵동 앱에서 이용해 주세요.');
         const operations=await privacy.prepare(user,payload.operations);
+        const audience=calendarAudience(user,operations);
         db.exec('BEGIN IMMEDIATE');try{for(const op of operations)operation(user,op);reconcileExchanges();db.exec('COMMIT');}catch(error){db.exec('ROLLBACK');throw error;}
         if(operations.some(op=>(op.type==='mail.send'&&op.value?.scheduled)||(op.type==='mail.update'&&op.recall)))dispatch.refresh();
-        notify();send(res,200,{ok:true});return;
+        notify(audience);send(res,200,{ok:true});return;
       }
       if(route==='/admin/staff-import'&&req.method==='POST'){
         if(!user.admin)fail(403,'관리자만 교직원 엑셀을 등록할 수 있습니다.');
@@ -705,7 +731,7 @@ async function startServer(options = {}) {
     maintaining??=maintain().catch(error=>options.onError?.(error)).finally(()=>{maintaining=null;});
     return maintaining;
   },60000);
-  function stopTimers(){dispatch.close();timers.clearInterval(maintenance);}
+  function stopTimers(){stopping=true;dispatch.close();timers.clearInterval(maintenance);if(presenceTimer!==null)timers.clearTimeout(presenceTimer);presenceTimer=null;}
   dispatch.refresh();
   await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(port,options.host||'0.0.0.0',resolve);}).catch(async error=>{stopTimers();await maintaining;db.close();throw error;});
   const boundPort=server.address().port;
@@ -713,7 +739,7 @@ async function startServer(options = {}) {
   // A port selected by the OS must be reflected in the exported connection file.
   if(port===0)connection.url=`https://${addressURL.hostname}:${boundPort}`;
   fs.writeFileSync(path.join(dataDir,'dingdong-server.json'),json(connection),{mode:0o600});
-  return {port:boundPort,connection,dataDir,stats:()=>({attachmentSpace:relay?.blobs.space(),users:db.prepare('SELECT count(*) n FROM users WHERE disabled=0').get().n,online:streams.size,rooms:db.prepare('SELECT count(*) n FROM rooms').get().n,messages:db.prepare('SELECT count(*) n FROM private_content').get().n+(relay?db.prepare('SELECT count(*) n FROM relay_packets').get().n:0)}),backup(destination){db.exec('PRAGMA wal_checkpoint(TRUNCATE)');fs.copyFileSync(databasePath,destination);const backup=new DatabaseSync(destination);try{if(relay){backup.exec('PRAGMA secure_delete=ON; DELETE FROM relay_send_proofs; DELETE FROM relay_blobs; DELETE FROM relay_positions; DELETE FROM relay_targets; DELETE FROM relay_packets; DELETE FROM relay_files; DELETE FROM relay_legacy_files; DELETE FROM relay_migrated; DELETE FROM recipients; DELETE FROM mail_work_responses; DELETE FROM homeroom_days; DELETE FROM mails; DELETE FROM reactions; DELETE FROM messages; DELETE FROM room_members; DELETE FROM rooms; DELETE FROM private_deliveries; DELETE FROM auto_deadline_sources;');}backup.exec("PRAGMA secure_delete=ON; DELETE FROM sessions; DELETE FROM private_content; DELETE FROM retained_files; DELETE FROM items; UPDATE mail_work_responses SET note='';");for(const e of backup.prepare('SELECT id,payload FROM events').all()){const value=parse(e.payload);if(value.source||value.type==='personal'||relay&&(value.noticeMail||value.deliveryMail||db.prepare('SELECT payload FROM mails').all().some(m=>parse(m.payload).calendarEvent===e.id)))backup.prepare('DELETE FROM events WHERE id=?').run(e.id);else if(value.noticeMail||value.deliveryMail){value.note='';backup.prepare('UPDATE events SET payload=? WHERE id=?').run(json(value),e.id);}}for(const table of ['mails','messages'])for(const row of backup.prepare('SELECT id,payload FROM '+table).all()){const p=parse(row.payload);for(const k of ['title','body','html','text','reply'])delete p[k];backup.prepare('UPDATE '+table+' SET payload=? WHERE id=?').run(json(p),row.id);}backup.exec('VACUUM;');}finally{backup.close();}},async close(){stopTimers();await maintaining;for(const connections of streams.values())for(const res of connections)res.end();await new Promise(resolve=>server.close(resolve));db.close();}};
+  return {port:boundPort,connection,dataDir,stats:()=>({attachmentSpace:relay?.blobs.space(),users:db.prepare('SELECT count(*) n FROM users WHERE disabled=0').get().n,online:streams.size,rooms:db.prepare('SELECT count(*) n FROM rooms').get().n,messages:db.prepare('SELECT count(*) n FROM private_content').get().n+(relay?db.prepare('SELECT count(*) n FROM relay_packets').get().n:0)}),backup(destination){db.exec('PRAGMA wal_checkpoint(TRUNCATE)');fs.copyFileSync(databasePath,destination);const backup=new DatabaseSync(destination);try{if(relay){backup.exec('PRAGMA secure_delete=ON; DELETE FROM relay_send_proofs; DELETE FROM relay_blobs; DELETE FROM relay_positions; DELETE FROM relay_targets; DELETE FROM relay_packets; DELETE FROM relay_files; DELETE FROM relay_legacy_files; DELETE FROM relay_migrated; DELETE FROM recipients; DELETE FROM mail_work_responses; DELETE FROM homeroom_days; DELETE FROM mails; DELETE FROM reactions; DELETE FROM messages; DELETE FROM room_members; DELETE FROM rooms; DELETE FROM private_deliveries; DELETE FROM auto_deadline_sources;');}backup.exec("PRAGMA secure_delete=ON; DELETE FROM sessions; DELETE FROM private_content; DELETE FROM retained_files; DELETE FROM items; UPDATE mail_work_responses SET note='';");const linkedCalendars=relay?new Set(db.prepare('SELECT payload FROM mails').all().map(m=>parse(m.payload).calendarEvent).filter(Boolean)):new Set();for(const e of backup.prepare('SELECT id,payload FROM events').all()){const value=parse(e.payload);if(value.source||value.type==='personal'||relay&&(value.noticeMail||value.deliveryMail||linkedCalendars.has(e.id)))backup.prepare('DELETE FROM events WHERE id=?').run(e.id);else if(value.noticeMail||value.deliveryMail){value.note='';backup.prepare('UPDATE events SET payload=? WHERE id=?').run(json(value),e.id);}}for(const table of ['mails','messages'])for(const row of backup.prepare('SELECT id,payload FROM '+table).all()){const p=parse(row.payload);for(const k of ['title','body','html','text','reply'])delete p[k];backup.prepare('UPDATE '+table+' SET payload=? WHERE id=?').run(json(p),row.id);}backup.exec('VACUUM;');}finally{backup.close();}},async close(){stopTimers();await maintaining;for(const connections of streams.values())for(const res of connections)res.end();await new Promise(resolve=>server.close(resolve));db.close();}};
 }
 module.exports={startServer,passwordRecord};
 

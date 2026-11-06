@@ -24,7 +24,14 @@ class DingdongBackend{
   }
   clearTimeout(this.loginRetry);this.activate(result);return result;
  }
- activate(result){this.user=result.user;this.active=true;this.baseline=clone(result.data);this.callbacks.data(result);this.callbacks.status(result.offline?'PC 보관 기록 · 연결 끊김':result.incomingFailures?'연결됨 · 수신 확인 필요 '+result.incomingFailures+'건':result.publicSavePending?'연결됨 · 공용 변경 서버 반영 대기 '+result.publicSavePending+'건':result.deliveryFailures?'연결됨 · 전달 실패 '+result.deliveryFailures+'건':result.publicSaveFailures?'연결됨 · 공용 변경 거절 기록 '+result.publicSaveFailures+'건':result.receiptPending?'PC 저장 완료 · 저장 확인 전송 대기':result.outgoingPending?'연결됨 · 발송 재시도 중':'연결됨');if(result.receiptPending||result.outgoingPending)this.scheduleRefresh(3000);else if(result.privacy?.more)this.scheduleRefresh();}
+ rememberPresence(value,snapshot=false){
+  if(!value||typeof value.epoch!=='string'||!Number.isSafeInteger(value.revision)||value.revision<0||!Array.isArray(value.online)||value.online.some(id=>typeof id!=='string'))return false;
+  const old=this.presence;
+  if(!old||old.epoch===value.epoch&&old.revision<=value.revision||!snapshot&&old.epoch!==value.epoch)this.presence=value;
+  return true;
+ }
+ applyPresence(data){if(!this.presence||!data?.people)return;const online=new Set(this.presence.online);for(const person of data.people)person.status=online.has(person.id)?'online':'offline';}
+ activate(result){this.rememberPresence(result.presence,true);this.applyPresence(result.data);this.user=result.user;this.active=true;this.baseline=clone(result.data);this.callbacks.data(result);this.callbacks.status(result.offline?'PC 보관 기록 · 연결 끊김':result.incomingFailures?'연결됨 · 수신 확인 필요 '+result.incomingFailures+'건':result.publicSavePending?'연결됨 · 공용 변경 서버 반영 대기 '+result.publicSavePending+'건':result.deliveryFailures?'연결됨 · 전달 실패 '+result.deliveryFailures+'건':result.publicSaveFailures?'연결됨 · 공용 변경 거절 기록 '+result.publicSaveFailures+'건':result.receiptPending?'PC 저장 완료 · 저장 확인 전송 대기':result.outgoingPending?'연결됨 · 발송 재시도 중':'연결됨');if(result.offline||result.receiptPending||result.outgoingPending)this.scheduleRefresh(3000);else if(result.privacy?.more)this.scheduleRefresh();}
  async login(username,password,remember=false){
   this.generation++;clearTimeout(this.loginRetry);this.waitingForServer=false;
   const result=await this.native.request('/login',{username,password,remember});if(result.error)throw new Error(result.error);
@@ -32,7 +39,7 @@ class DingdongBackend{
   if(result.loginWarning)this.callbacks.loginWarning(result.loginWarning);return result.user;
  }
  async changePassword(current,password){const result=await this.native.request('/password',{current,password});if(result.error)throw new Error(result.error);await this.refresh();if(result.loginWarning)this.callbacks.loginWarning(result.loginWarning);}
- async logout(){this.active=false;this.generation++;clearTimeout(this.loginRetry);this.baseline=null;const result=await this.native.request('/logout',{});if(result.error)throw Error(result.error);}
+ async logout(){this.active=false;this.generation++;clearTimeout(this.loginRetry);clearTimeout(this.refreshTimer);this.refreshTimer=null;this.refreshAgain=false;this.presence=null;this.baseline=null;const result=await this.native.request('/logout',{});if(result.error)throw Error(result.error);}
  diff(before,after){const operations=[];if(!before)return operations;
   if(!same(before.classTeachers,after.classTeachers))operations.push({type:'classes.upsert',value:{classes:after.classTeachers||[]}});
   const oldRooms=new Map(before.rooms.map(r=>[r.id,r]));
@@ -52,9 +59,21 @@ class DingdongBackend{
  sync(data,onResult){if(!this.active)return Promise.resolve(false);const before=this.baseline,snapshot=clone(data),operations=this.diff(before,snapshot);this.baseline=snapshot;if(!operations.length)return Promise.resolve(true);const generation=this.generation;this.pending++;this.callbacks.status('저장 중');
   const job=this.queue.then(async()=>{if(generation!==this.generation)return false;try{const result=await this.native.request('/sync',{operations});this.lastSyncResult=result;onResult?.(result);if(result.error)throw new Error(result.error);this.callbacks.status(result.publicSave==='pending'?'공용 변경 서버 반영 대기':Object.values(result.delivery||{}).includes('review')?'발송 여부 확인 필요 · 보낸함 확인':result.failed?'발송 실패 · 보낸함 확인':result.queued?'PC에 발송 대기 중':'연결됨');return true;}catch(error){if(this.generation===generation){this.generation++;this.baseline=before;this.callbacks.error(error.message);}return false;}}).finally(async()=>{this.pending--;if(!this.pending){clearTimeout(this.refreshTimer);this.refreshTimer=null;await this.refresh();}});this.queue=job.catch(()=>false);return job;
  }
- scheduleRefresh(delay=0){if(this.refreshTimer||!this.active)return;this.refreshTimer=setTimeout(()=>{this.refreshTimer=null;this.refresh();},delay);}
- async refresh(){if(this.pending||!this.user)return;const generation=this.generation;try{const result=await this.native.request('/bootstrap');if(generation!==this.generation)return;if(result.error){if(result.status===401){this.active=false;this.callbacks.expired();}else this.callbacks.status('연결 확인 필요');return;}this.activate(result);}catch{this.callbacks.status('연결 끊김');}}
- onEvent(event){if(event.kind==='connected'&&!this.active){this.init().catch(()=>this.callbacks.status('연결 확인 필요'));return;}if(['changed','presence','ready','connected'].includes(event.kind))this.scheduleRefresh();if(event.kind==='disconnected')this.callbacks.status('재연결 중');if(event.kind==='expired'||event.kind==='logout'){this.generation++;clearTimeout(this.loginRetry);clearTimeout(this.refreshTimer);this.waitingForServer=false;this.refreshTimer=null;this.active=false;this.user=null;this.baseline=null;this.callbacks.expired();}}
+ scheduleRefresh(delay=100){if(!this.active)return;const due=Date.now()+delay;if(this.refreshTimer&&this.refreshDue<=due)return;clearTimeout(this.refreshTimer);this.refreshDue=due;this.refreshTimer=setTimeout(()=>{this.refreshTimer=null;this.refresh();},delay);}
+ refresh(){
+  if(this.pending||!this.user)return Promise.resolve();
+  if(this.refreshJob){this.refreshAgain=true;return this.refreshJob;}
+  const generation=this.generation;
+  const job=(async()=>{try{const result=await this.native.request('/bootstrap');if(generation!==this.generation)return;if(result.error){if(result.status===401){this.active=false;this.callbacks.expired();}else this.callbacks.status('연결 확인 필요');return;}this.activate(result);}catch{if(generation===this.generation)this.callbacks.status('연결 끊김');}})();
+  this.refreshJob=job.finally(()=>{this.refreshJob=null;if(this.refreshAgain){this.refreshAgain=false;this.scheduleRefresh();}});return this.refreshJob;
+ }
+ onEvent(event){
+  if(event.kind==='connected'){this.presence=null;if(!this.active){this.init().catch(()=>this.callbacks.status('연결 확인 필요'));return;}}
+  if(event.kind==='presence'&&this.rememberPresence(event.presence)){this.applyPresence(this.baseline);if(this.active&&this.baseline)this.callbacks.presence?.(clone(this.baseline.people));return;}
+  if(['changed','presence','ready','connected'].includes(event.kind))this.scheduleRefresh();
+  if(event.kind==='disconnected')this.callbacks.status('재연결 중');
+  if(event.kind==='expired'||event.kind==='logout'){this.generation++;clearTimeout(this.loginRetry);clearTimeout(this.refreshTimer);this.waitingForServer=false;this.refreshTimer=null;this.refreshAgain=false;this.presence=null;this.active=false;this.user=null;this.baseline=null;this.callbacks.expired();}
+ }
 }
 window.DingdongBackend=DingdongBackend;
 })();

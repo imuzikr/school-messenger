@@ -228,6 +228,21 @@
     if($("#org-tree"))$("#org-tree").scrollTop=orgScroll;
     if($("#main-content"))$("#main-content").scrollTop=currentScroll;
   }
+  function acceptPresence(people) {
+    const statuses=new Map(people.map(p=>[p.id,p.status]));
+    for(const p of state.data.people)if(statuses.has(p.id))p.status=statuses.get(p.id);
+    if(state.profile&&statuses.has(state.profile.id))state.profile.status=statuses.get(state.profile.id);
+    // Patch indicators in place: keep search, selection, drafts and focus intact.
+    for(const row of $$('.person[data-person]')){
+      const p=state.data.people.find(p=>p.id===row.dataset.person),indicator=row.querySelector('.person-presence');if(!p||!indicator)continue;
+      const template=document.createElement('template');template.innerHTML=personRow(p);
+      indicator.replaceWith(template.content.querySelector('.person-presence'));
+      const line=row.querySelector('.person-line');if(line)line.title=template.content.querySelector('.person-line').title;
+    }
+    for(const el of $$('[data-presence-user]')){const status=statuses.get(el.dataset.presenceUser);if(status)el.querySelector('.status')?.setAttribute('class','status '+status);}
+    const total=state.data.people.length,online=state.data.people.filter(p=>p.status==='online').length;
+    for(const el of $$('.school-population')){el.setAttribute('aria-label',`전체 ${total}명, 접속 ${online}명`);const count=el.querySelector('.population-online');if(count)count.textContent='접속 '+online;}
+  }
   let briefingQueued=false;
   function koreanToday(){const parts=new Intl.DateTimeFormat("en-US",{timeZone:"Asia/Seoul",year:"numeric",month:"2-digit",day:"2-digit"}).formatToParts(new Date());const get=key=>parts.find(p=>p.type===key).value;return `${get("year")}-${get("month")}-${get("day")}`;}
   function maybeShowBriefing(){
@@ -336,7 +351,7 @@
       status: "online",
     };
   const avatar = (p, size = "", i = 0) =>
-    `<span class="avatar ${["", "blue", "peach", "purple"][i % 4]} ${size}" aria-hidden="true">${esc(p.name.slice(0, 1))}<i class="status ${p.status || "online"}"></i></span>`;
+    `<span class="avatar ${["", "blue", "peach", "purple"][i % 4]} ${size}" data-presence-user="${esc(p.id||'')}" aria-hidden="true">${esc(p.name.slice(0, 1))}<i class="status ${p.status || "online"}"></i></span>`;
   const toast = (title, body = "", type = "message") =>
     Notify.create({ title, bodyHtml: esc(body), type });
   const shownReceipts=new Set();let receiptAckBusy=false;
@@ -558,7 +573,7 @@
         )
         .join(
           "",
-        )}</div></div><div class="search">${icon("search", 17)}<input class="input" id="people-search" aria-label="교직원 검색" placeholder="이름, 부서, 교과, 학년, 기타 그룹 검색" value="${esc(state.search)}"></div><div class="school-tools"><small class="muted">v0.2.122</small></div><div class="people-summary"><label class="select-label"><input id="select-all" type="checkbox" ${state.selected.size === state.data.people.length ? "checked" : ""}>전체 선택</label><span id="selected-count">${state.selected.size ? state.selected.size + "명 선택" : "이름을 더블클릭해 메시지를 보내세요"}</span></div><div class="org-tree" id="org-tree">${orgTree()}</div></section><aside class="side-stack">${todayPanel()}<div class="quiet-card">${icon("leaf", 28)}<div><strong style="font-size:12px">오늘도, 서로에게 든든한 동료.</strong><p>작은 인사가 하루를 바꿔요.</p></div></div><div class="welcome-strip">TEACH · CONNECT · GROW</div></aside></div>`
+        )}</div></div><div class="search">${icon("search", 17)}<input class="input" id="people-search" aria-label="교직원 검색" placeholder="이름, 부서, 교과, 학년, 기타 그룹 검색" value="${esc(state.search)}"></div><div class="school-tools"><small class="muted">v0.2.136</small></div><div class="people-summary"><label class="select-label"><input id="select-all" type="checkbox" ${state.selected.size === state.data.people.length ? "checked" : ""}>전체 선택</label><span id="selected-count">${state.selected.size ? state.selected.size + "명 선택" : "이름을 더블클릭해 메시지를 보내세요"}</span></div><div class="org-tree" id="org-tree">${orgTree()}</div></section><aside class="side-stack">${todayPanel()}<div class="quiet-card">${icon("leaf", 28)}<div><strong style="font-size:12px">오늘도, 서로에게 든든한 동료.</strong><p>작은 인사가 하루를 바꿔요.</p></div></div><div class="welcome-strip">TEACH · CONNECT · GROW</div></aside></div>`
     );
   }
   const groupLabel=p=>String(p[state.group]||"").trim()||({grade:"학년 미지정",otherGroup:"기타 미지정"}[state.group]||"미지정");
@@ -3589,6 +3604,7 @@
   if(native){
     network=new DingdongBackend(native,{
       data:acceptServerData,
+      presence:acceptPresence,
       loginWarning(message){toast("자동 로그인 안내",message);},
       loginRetryEnded(){const message=$("#login-error");if(message)message.textContent="아이디와 비밀번호로 다시 로그인해 주세요.";},
       status(value){connectionStatus=value;const el=$("#connection-status span");if(el)el.textContent=value;$("#connection-status")?.classList.toggle("offline",["연결 끊김","재연결 중","연결 확인 필요"].includes(value));},
